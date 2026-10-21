@@ -288,10 +288,10 @@ class LaunchersTest(launcher_testing.LauncherTestCase):
     self.assertEqual(
         rl_train["checkpointing_options"]["save_interval_steps"], 0
     )
-    # No metrics backends and no trajectory logs.
+    # No metrics backends and no trajectory store.
     self.assertIsNone(rl_train["metrics_logging_options"])
     self.assertIsNone(orchestrator.build_metrics_logging_options(hp))
-    self.assertEqual(config["dist_training_config"]["trajectory_log_dir"], "")
+    self.assertIs(config["trajectory_store_config"]["enable"], False)
     self.assertEqual(
         config["env_kwargs"]["max_steps"],
         config["agentic_grpo_config"]["max_turns"],

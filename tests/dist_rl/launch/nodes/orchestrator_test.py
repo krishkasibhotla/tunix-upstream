@@ -1046,46 +1046,49 @@ class ProgramTest(absltest.TestCase):
         program_span.group_order, rl_program.GroupOrder.TRAJECTORY_COMPLETION
     )
 
-  def test_trajectory_logs_follow_the_metrics_logging_options(self):
+  def test_build_program_forwards_trajectory_store_and_metrics_options(self):
     artifact_root = self.create_tempdir().full_path
-    # By default, the metrics and the trajectories go under the artifact root.
     hp = _config(f"cluster_config.artifact_root={artifact_root}")
     options = orchestrator.build_metrics_logging_options(hp)
     assert options is not None  # Narrows the type for pytype.
     self.assertEqual(options.log_dir, f"{artifact_root}/metrics")
     program = self._build_program(hp, reward_fns=[])
     self.addCleanup(program.close)
-    self.assertIsNotNone(program.trajectory_logger)
-    # Null metrics logging options log neither, ...
-    no_metrics = (
+    self.assertIsNone(program.trajectory_store)
+
+    hp_no_metrics = _config(
         f"cluster_config.artifact_root={artifact_root}",
         "rl_training_config.metrics_logging_options=null",
     )
-    hp = _config(*no_metrics)
-    self.assertIsNone(orchestrator.build_metrics_logging_options(hp))
-    program = self._build_program(hp, reward_fns=[])
-    self.addCleanup(program.close)
-    self.assertIsNone(program.trajectory_logger)
-    # ... unless a trajectory directory is set.
-    hp = _config(
-        *no_metrics,
-        f"dist_training_config.trajectory_log_dir={artifact_root}/trajectories",
-    )
-    program = self._build_program(hp, reward_fns=[])
-    self.addCleanup(program.close)
-    self.assertIsNotNone(program.trajectory_logger)
+    self.assertIsNone(orchestrator.build_metrics_logging_options(hp_no_metrics))
 
-  def test_trajectory_logging_false_logs_no_trajectories(self):
-    artifact_root = self.create_tempdir().full_path
-    hp = _config(
+    hp_store = _config(
         f"cluster_config.artifact_root={artifact_root}",
-        "dist_training_config.trajectory_logging=false",
+        "cluster_config.run_id=run_0",
+        "trajectory_store_config.enable=true",
     )
-    # The metrics are still logged, but not the trajectories.
-    self.assertIsNotNone(orchestrator.build_metrics_logging_options(hp))
-    program = self._build_program(hp, reward_fns=[])
-    self.addCleanup(program.close)
-    self.assertIsNone(program.trajectory_logger)
+    cluster = orchestrator.create_cluster(
+        hp_store,
+        weight_sync_timeouts=orchestrator.resolve_weight_sync_timeouts(
+            hp_store
+        )[0],
+    )
+    self.addCleanup(cluster.shutdown)
+    self.assertIsNotNone(cluster.trajectory_store)
+    program_with_store = orchestrator.build_program(
+        hp_store,
+        algo_config=orchestrator.build_grpo_config(hp_store),
+        reward_fns=[],
+        pad_id=0,
+        eos_id=1,
+        prompt_items=grain.MapDataset.source([]),
+        trajectory_store=cluster.trajectory_store,
+        metrics_logging_options=orchestrator.build_metrics_logging_options(
+            hp_store
+        ),
+    )
+    self.addCleanup(program_with_store.close)
+    self.assertIs(program_with_store.trajectory_store, cluster.trajectory_store)
 
   def test_env_reward_mode_runs_without_reward_functions(self):
     hp = self._program_config()

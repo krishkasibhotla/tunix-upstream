@@ -468,35 +468,6 @@ weight_sync_config:
           ["rl_training_config.metrics_logging_options=off"]
       )
 
-  def test_trajectory_logging(self):
-    dist_train = resolve_config.initialize([]).config_mapping(
-        "dist_training_config"
-    )
-    self.assertIs(dist_train["trajectory_logging"], True)
-    self.assertEqual(dist_train["trajectory_log_dir"], "")
-    dist_train = resolve_config.initialize(
-        ["dist_training_config.trajectory_logging=false"]
-    ).config_mapping("dist_training_config")
-    self.assertIs(dist_train["trajectory_logging"], False)
-    # A directory for trajectories that are never logged is contradictory.
-    with self.assertRaisesRegex(
-        ValueError,
-        "trajectory_logging=false logs no trajectories, but"
-        " dist_training_config.trajectory_log_dir is set",
-    ):
-      resolve_config.initialize([
-          "dist_training_config.trajectory_logging=false",
-          "dist_training_config.trajectory_log_dir=/logs/trajectories",
-      ])
-    for value in ("yes_please", "0"):
-      with self.subTest(value=value):
-        with self.assertRaisesRegex(
-            TypeError, "dist_training_config.trajectory_logging must be a bool"
-        ):
-          resolve_config.initialize(
-              [f"dist_training_config.trajectory_logging={value}"]
-          )
-
   def test_rollout_logps_settings(self):
     rs_band = [
         "agentic_grpo_config.sampler_rs_min=0.999",

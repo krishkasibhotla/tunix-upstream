@@ -111,13 +111,11 @@ def dist_launch(workload, output, model_dir):
       "model_config.dtype": _COMPUTE_DTYPE,
       "model_config.load_dtype": _LOAD_DTYPE,
       "vllm_config.hbm_utilization": _HBM_UTILIZATION,
-      # Benchmark hooks write events.jsonl; checkpoints, metrics backends, and
-      # trajectory logs would add untimed I/O. Null metrics logging options
-      # create no metrics backends, as in `agentic_config`, and with no
-      # `trajectory_log_dir` no trajectories are logged either.
+      # Benchmark hooks write events.jsonl; checkpoints and metrics backends
+      # would add untimed I/O (`trajectory_store_config.enable` is already
+      # false in `base_dist_config.yaml`).
       "rl_training_config.checkpointing_options.save_interval_steps": 0,
       "rl_training_config.metrics_logging_options": "null",
-      "dist_training_config.trajectory_log_dir": '""',
       "rl_training_config.train_micro_batch_size": microbatch_size,
       "rl_training_config.compute_logps_micro_batch_size": microbatch_size,
   }

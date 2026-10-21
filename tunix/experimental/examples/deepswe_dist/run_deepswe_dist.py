@@ -329,24 +329,6 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
       help="Directory for local event logging (TensorBoard/CLU).",
   )
   parser.add_argument(
-      "--trajectory_log_dir",
-      type=str,
-      default=os.getenv("TRAJECTORY_LOG_DIR", None),
-      help=(
-          "Directory for trajectory logging. Defaults to "
-          "<log_dir>/trajectories when log_dir is set."
-      ),
-  )
-  parser.add_argument(
-      "--trajectory_logging",
-      action=argparse.BooleanOptionalAction,
-      default=_str2bool(os.getenv("TRAJECTORY_LOGGING", "true")),
-      help=(
-          "Whether to write monolithic JSON trajectory logs to"
-          " trajectory_log_dir."
-      ),
-  )
-  parser.add_argument(
       "--wandb_entity",
       type=str,
       default=os.getenv("WANDB_ENTITY", ""),
@@ -880,9 +862,6 @@ def main(argv: list[str], context: ProcessContext | None = None) -> None:
                 num_data_shards=args.num_data_shards,
             ),
             metrics_logging_options=metrics_logging_options,
-            trajectory_log_dir=(
-                args.trajectory_log_dir if args.trajectory_logging else ""
-            ),
             trajectory_store=cluster.trajectory_store,
             max_staleness=args.max_staleness,
             max_version_span=args.max_version_span,

@@ -219,15 +219,6 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
       help="Directory for local event logging (TensorBoard/CLU).",
   )
   parser.add_argument(
-      "--trajectory_log_dir",
-      type=str,
-      default=os.getenv("TRAJECTORY_LOG_DIR", None),
-      help=(
-          "Directory for trajectory logging. Defaults to "
-          "<log_dir>/trajectories when log_dir is set."
-      ),
-  )
-  parser.add_argument(
       "--wandb_project",
       type=str,
       default=os.getenv("WANDB_PROJECT", "trellis-deepswe"),
@@ -568,7 +559,6 @@ def main(argv: list[str], context: ProcessContext | None = None) -> None:
             num_data_shards=args.num_data_shards,
         ),
         metrics_logging_options=metrics_logging_options,
-        trajectory_log_dir=args.trajectory_log_dir,
         trajectory_store=cluster.trajectory_store,
         max_staleness=args.max_staleness,
         group_order=args.trajectory_group_order,

@@ -174,7 +174,6 @@
           "precompile_trainer": true,
           "reward_fns": [],
           "sync_weights": false,
-          "trajectory_log_dir": null,
           "trajectory_store": null
         }
       }

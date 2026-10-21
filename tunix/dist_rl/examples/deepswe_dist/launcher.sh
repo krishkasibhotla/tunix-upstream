@@ -86,7 +86,6 @@ WANDB_PROJECT=${WANDB_PROJECT:-trellis-deepswe}
 WANDB_RUN_NAME=${WANDB_RUN_NAME:-}
 WANDB_API_KEY=${WANDB_API_KEY:-}
 LOG_DIR=${LOG_DIR:-}
-TRAJECTORY_LOG_DIR=${TRAJECTORY_LOG_DIR:-}
 OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-}
 OTEL_METRIC_EXPORT_INTERVAL=${OTEL_METRIC_EXPORT_INTERVAL:-}
 RUN_ID=${RUN_ID:-run_$(date -u +%Y%m%d_%H%M%S)_$$}
@@ -430,9 +429,6 @@ echo "Launching CPU orchestrator..."
   fi
   if [[ -n "$LOG_DIR" ]]; then
     ORCHESTRATOR_CMD+=(--log_dir="$LOG_DIR")
-  fi
-  if [[ -n "$TRAJECTORY_LOG_DIR" ]]; then
-    ORCHESTRATOR_CMD+=(--trajectory_log_dir="$TRAJECTORY_LOG_DIR")
   fi
   if [[ -n "${ROLLOUT_FAULT_TOLERANCE:-}" ]]; then
     ORCHESTRATOR_CMD+=(--rollout_fault_tolerance="$ROLLOUT_FAULT_TOLERANCE")

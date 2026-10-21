@@ -188,7 +188,6 @@ class FrozenLakeBenchmarkTest(unittest.TestCase):
         "model_config.load_dtype": "float32",
         "rl_training_config.checkpointing_options.save_interval_steps": "0",
         "rl_training_config.metrics_logging_options": "null",
-        "dist_training_config.trajectory_log_dir": "",
     }.items():
       self.assertEqual(overrides[name], value, name)
     # launch.sh fails on the old launchers' environment variables.

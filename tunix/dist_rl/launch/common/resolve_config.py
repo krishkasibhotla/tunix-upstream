@@ -217,9 +217,6 @@ def _finalize_dist_defaults(hp: cli_config.HyperParameters) -> None:
           f" null, got {type(metrics).__name__}."
       )
     if not metrics["log_dir"]:
-      # The orchestrator also logs trajectories under `<log_dir>/trajectories`
-      # unless `dist_training_config.trajectory_log_dir` is set or
-      # `dist_training_config.trajectory_logging` is false.
       metrics["log_dir"] = str(artifact_root / "metrics")
 
   traj_store = _mutable_section(hp, "trajectory_store_config")
@@ -487,37 +484,6 @@ def _validate_rollout_replicas(hp: cli_config.HyperParameters) -> None:
     )
 
 
-def _validate_trajectory_logging(hp: cli_config.HyperParameters) -> None:
-  """Checks `dist_training_config.trajectory_logging`.
-
-  `trajectory_log_dir` names where the trajectories go, so it must be empty
-  when `trajectory_logging` is false.
-
-  Args:
-    hp: Loaded configuration.
-
-  Raises:
-    TypeError: If `trajectory_logging` is not a bool.
-    ValueError: If `trajectory_logging` is false and `trajectory_log_dir` is
-      not empty.
-  """
-  dist_train = hp.config_mapping("dist_training_config")
-  enabled = dist_train["trajectory_logging"]
-  if not isinstance(enabled, bool):
-    raise TypeError(
-        "dist_training_config.trajectory_logging must be a bool, got"
-        f" {enabled!r}."
-    )
-  log_dir = dist_train["trajectory_log_dir"]
-  if not enabled and log_dir:
-    raise ValueError(
-        "dist_training_config.trajectory_logging=false logs no trajectories,"
-        " but dist_training_config.trajectory_log_dir is set"
-        f" ({log_dir!r}). Clear trajectory_log_dir or set"
-        " trajectory_logging=true."
-    )
-
-
 # `agentic_grpo_config` keys that only take effect with `use_rollout_logps:
 # true`. `sampler_is` is left out: it defaults to "token", which runs with
 # `use_rollout_logps: false` keep.
@@ -626,7 +592,6 @@ def _validate_dist_invariants(hp: cli_config.HyperParameters) -> None:
   _validate_k8s_scalars(hp)
   _validate_k8s_worker_jobsets(hp)
   _validate_rollout_replicas(hp)
-  _validate_trajectory_logging(hp)
   _validate_rollout_logps_settings(hp)
   _validate_fault_tolerance(hp)
   batch_size = int(hp.config["batch_size"])

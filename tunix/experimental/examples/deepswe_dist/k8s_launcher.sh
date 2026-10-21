@@ -184,8 +184,6 @@ export WANDB_PROJECT=${WANDB_PROJECT:-trellis-deepswe}
 export WANDB_RUN_NAME=${WANDB_RUN_NAME:-}
 export WANDB_API_KEY=${WANDB_API_KEY:-}
 export LOG_DIR=${LOG_DIR:-}
-export TRAJECTORY_LOG_DIR=${TRAJECTORY_LOG_DIR:-}
-export TRAJECTORY_LOGGING=${TRAJECTORY_LOGGING:-true}
 export RUN_ID=${RUN_ID:-${JOB_PREFIX}}
 export TRAJECTORY_STORE_ENABLED=${TRAJECTORY_STORE_ENABLED:-false}
 export TRAJECTORY_STORE_BACKEND=${TRAJECTORY_STORE_BACKEND:-file}
@@ -419,7 +417,6 @@ start_orchestrator() {
       ${WANDB_API_KEY:+WANDB_API_KEY=\"${WANDB_API_KEY}\"} \
       ${WANDB_ENTITY:+WANDB_ENTITY=\"${WANDB_ENTITY}\"} \
       ${LOG_DIR:+LOG_DIR=\"${LOG_DIR}\"} \
-      ${TRAJECTORY_LOG_DIR:+TRAJECTORY_LOG_DIR=\"${TRAJECTORY_LOG_DIR}\"} \
       WANDB_PROJECT=\"${WANDB_PROJECT}\" \
       WANDB_RUN_NAME=\"${WANDB_RUN_NAME}\" \
       ${sandbox_env} \
@@ -490,13 +487,11 @@ start_orchestrator() {
         --run_id=\"${RUN_ID}\" \
         ${MAX_WARMPOOL_REPLICAS:+--max_warmpool_replicas=${MAX_WARMPOOL_REPLICAS}} \
         $([[ "${USE_ROLLOUT_LOGPS}" == "false" || "${USE_ROLLOUT_LOGPS}" == "False" || "${USE_ROLLOUT_LOGPS}" == "0" ]] && echo --no-use_rollout_logps || echo --use_rollout_logps) \
-        $([[ "${TRAJECTORY_LOGGING}" == "false" || "${TRAJECTORY_LOGGING}" == "False" || "${TRAJECTORY_LOGGING}" == "0" ]] && echo --no-trajectory_logging || echo --trajectory_logging) \
         ${overlong_arg} \
         ${dataset_args} \
         ${shuffle_arg} \
         ${sandbox_arg} \
         ${LOG_DIR:+--log_dir=\"${LOG_DIR}\"} \
-        ${TRAJECTORY_LOG_DIR:+--trajectory_log_dir=\"${TRAJECTORY_LOG_DIR}\"} \
         ${MAX_SEQ_TOKEN_PER_TPU:+--max_seq_token_per_tpu=${MAX_SEQ_TOKEN_PER_TPU}} \
         ${MAX_SEGMENTS_PER_PACKED_ROW:+--max_segments_per_packed_row=${MAX_SEGMENTS_PER_PACKED_ROW}} \
         ${SEGMENT_ALIGNMENT_BOUNDARY:+--segment_alignment_boundary=${SEGMENT_ALIGNMENT_BOUNDARY}} \

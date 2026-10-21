@@ -24,7 +24,6 @@ import collections
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 import contextlib
 import dataclasses
-import os
 import sys
 import threading
 import time
@@ -43,12 +42,12 @@ from tunix.dist_rl.orchestrator import rl_engine_interface
 from tunix.dist_rl.orchestrator import step_telemetry
 from tunix.dist_rl.queue_manager import trajectory_queue_manager
 from tunix.dist_rl.trajectory import store as trajectory_store_lib
+from tunix.dist_rl.trajectory import trajectory as trajectory_lib
 from tunix.rl import algorithm_config
 from tunix.rl import common as rl_common
 from tunix.rl import function_registry
 from tunix.rl import reward_manager as reward_manager_lib
 from tunix.sft import metrics_logger as metrics_logger_lib
-from tunix.utils import trajectory_logger
 
 MetricsLogger = metrics_logger_lib.MetricsLogger
 MetricsLoggerOptions = metrics_logger_lib.MetricsLoggerOptions
@@ -202,66 +201,59 @@ def _extract_reward(item: Any) -> float:
   return float(traj["trajectory_reward"])
 
 
-def _extract_rollout_prompt(
-    metadata: Mapping[str, Any], conversation: Any
-) -> str:
-  """Extracts the initial prompt text for trajectory logging."""
-  if "prompt" in metadata and metadata["prompt"]:
-    return str(metadata["prompt"])
-  if not isinstance(conversation, list):
-    return ""
-  return next(
-      (
-          str(msg.get("content") or "")
-          for msg in conversation
-          if isinstance(msg, dict) and msg.get("role") == "user"
-      ),
-      "",
+def _build_consumed_trajectory_metrics(
+    item: datatypes.TrajectoryItem,
+    *,
+    mode: Mode,
+    log_step: int,
+    consumed_policy_version: int,
+    advantage: float | None,
+    step_stage_times: dict[str, float] | None,
+) -> trajectory_lib.TrajectoryMetrics:
+  """Builds `TrajectoryMetrics` for a rollout consumed at `log_step`."""
+  metadata = item.metadata
+  traj = item.traj if isinstance(item.traj, Mapping) else {}
+  raw_status = traj.get("status")
+  if isinstance(raw_status, datatypes.TrajectoryStatus):
+    raw_status = raw_status.name
+  status = str(raw_status) if raw_status else "UNKNOWN"
+  raw_reward = traj.get("trajectory_reward")
+  rollout_version = (
+      trajectory_queue_manager.item_policy_version(item)
+      if trajectory_queue_manager.has_policy_version(item)
+      else None
   )
-
-
-def _format_rollout_completion(conversation: Any) -> str:
-  """Renders post-prompt interaction (assistant + env) for trajectory logging.
-
-  In single-turn tasks (e.g. GSM8K), this yields the assistant's completion.
-  In multi-turn agentic environments (e.g. ToolAgent, DeepSWE), this preserves
-  both the assistant's turns and subsequent environment/tool feedback while
-  excluding the initial prompt.
-
-  Args:
-    conversation: Either a list of chat messages or an already-rendered string.
-
-  Returns:
-    The rendered completion string for trajectory logging.
-  """
-  if not isinstance(conversation, list):
-    return str(conversation)
-
-  # Find the end of the initial prompt (first user turn).
-  prompt_end_idx = 0
-  for idx, msg in enumerate(conversation):
-    if isinstance(msg, dict) and msg.get("role") == "user":
-      prompt_end_idx = idx + 1
-      break
-
-  post_prompt = conversation[prompt_end_idx:]
-  if not post_prompt:
-    return datatypes.assistant_text(conversation)
-
-  # For a single assistant turn (e.g. single-turn math), return raw content directly.
-  if len(post_prompt) == 1 and isinstance(post_prompt[0], dict):
-    return str(post_prompt[0].get("content", ""))
-
-  # For multi-turn interactions, include role labels so env observations and assistant actions are distinguishable.
-  lines = []
-  for msg in post_prompt:
-    if not isinstance(msg, dict):
-      continue
-    role = msg.get("role", "unknown")
-    content = str(msg.get("content", ""))
-    label = "environment" if role == "user" else role
-    lines.append(f"[{label}]: {content}")
-  return "\n".join(lines)
+  staleness = (
+      max(0, consumed_policy_version - rollout_version)
+      if item.is_valid and rollout_version is not None
+      else None
+  )
+  gold_answer = metadata.get("gold_answer")
+  if gold_answer is None:
+    gold_answer = metadata.get("answer")
+  return trajectory_lib.TrajectoryMetrics(
+      extra={
+          "mode": str(mode),
+          "global_step": log_step,
+          "consumed_policy_version": consumed_policy_version,
+          "rollout_policy_version": rollout_version,
+          "staleness": staleness,
+          "prompt_id": str(item.prompt_id),
+          "group_index": item.group_index,
+          "status": status,
+          "is_valid": item.is_valid,
+          "reward": float(raw_reward) if raw_reward is not None else None,
+          "advantage": advantage,
+          "consumed": True,
+          "question": metadata.get("question"),
+          "gold_answer": gold_answer,
+          "raw_length": metadata.get("raw_length"),
+          "clipped": metadata.get("clipped"),
+          "env_time": traj.get("env_time"),
+          "reward_time": traj.get("reward_time"),
+          "step_StageTime": step_stage_times,
+      }
+  )
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True, eq=False)
@@ -411,7 +403,6 @@ class StandardRLProgram(RLProgram):
       sync_weights: bool = True,
       precompile_trainer: bool = True,
       metrics_logging_options: MetricsLoggerOptions | None = None,
-      trajectory_log_dir: str | None = None,
       trajectory_store: trajectory_store_lib.TrajectoryStore | None = None,
       metrics_prefix: str = "",
       mode: Mode | str = Mode.TRAIN,
@@ -531,29 +522,11 @@ class StandardRLProgram(RLProgram):
     self.sync_weights = sync_weights
     self.precompile_trainer = precompile_trainer
     self.metrics_logger: MetricsLogger = MetricsLogger(metrics_logging_options)
-    if trajectory_log_dir is None and metrics_logging_options is not None:
-      log_dir = getattr(metrics_logging_options, "log_dir", "")
-      if log_dir:
-        trajectory_log_dir = os.path.join(log_dir, "trajectories")
-    self.trajectory_logger = (
-        trajectory_logger.AsyncTrajectoryLogger(trajectory_log_dir)
-        if trajectory_log_dir
-        else None
-    )
-    if trajectory_log_dir:
-      logging.info(
-          "Trajectory logging enabled; resolved trajectory_log_dir=%s",
-          trajectory_log_dir,
-      )
-    else:
-      logging.info("Trajectory logging disabled; no trajectory_log_dir set.")
     # Received, not built: the orchestrator running this program owns the
     # Trajectory Store's construction and lifecycle (ClusterOrchestrator, one
     # per process), since a store's lifetime should span the whole
     # orchestrator process rather than just one program run. This program
     # only uses it; close() below does not close it.
-    # TODO(sizhi): Wire active trajectory store reads/writes in pipeline stages
-    # in follow-up CLs.
     self._trajectory_store = trajectory_store
     self.metrics_prefix = metrics_prefix
     self.mode = mode if isinstance(mode, Mode) else Mode(mode)
@@ -620,15 +593,13 @@ class StandardRLProgram(RLProgram):
     return self._trajectory_store
 
   def close(self) -> None:
-    """Flushes and closes loggers, the reward manager, and program resources.
+    """Flushes and closes metrics loggers, the reward manager, and program resources.
 
     Does not close `self._trajectory_store`: this program does not own it
     (see `__init__`), and closing a store the orchestrator may still be
     using — e.g. across a second `run_program()` call — would be wrong.
     """
     try:
-      if self.trajectory_logger is not None:
-        self.trajectory_logger.stop()
       if self.metrics_logger is not None:
         self.metrics_logger.close()
     finally:
@@ -1434,50 +1405,70 @@ class StandardRLProgram(RLProgram):
       *,
       log_step: int,
       consumed_policy_version: int,
+      item_advantages: Sequence[float | None] | None = None,
+      step_times: step_telemetry.StepTimes | None = None,
+      filtered_groups: Sequence[Sequence[datatypes.TrajectoryItem]] = (),
   ) -> None:
-    """Persists one row per consumed rollout when trajectory logging is enabled."""
-    if self.trajectory_logger is None:
+    """Persists per-rollout metrics to `TrajectoryStore` when configured."""
+    if self._trajectory_store is None:
       return
-    for item in all_step_items:
-      metadata = dict(getattr(item, "metadata", None) or {})
-      metadata.pop("routed_experts", None)
-      metadata.pop("env_config", None)
-      # Logging must never take down a training step, so read defensively
-      # rather than reusing the strict `_extract_reward` above.
-      traj = dict(getattr(item, "traj", None) or {})
-      traj.pop("routed_experts", None)
-      status = traj.get("status", None)
-      reward = traj.get("trajectory_reward", None)
-      if isinstance(status, datatypes.TrajectoryStatus):
-        status = status.name
-      row = {
-          "global_step": log_step,
-          "consumed_policy_version": consumed_policy_version,
-          "prompt_id": getattr(item, "prompt_id", ""),
-          "group_index": getattr(item, "group_index", 0),
-          "rollout_policy_version": (
+    advantages = (
+        item_advantages
+        if item_advantages is not None
+        else (None,) * len(all_step_items)
+    )
+    step_stage_times = (
+        dataclasses.asdict(step_times) if step_times is not None else None
+    )
+    for item, advantage in zip(all_step_items, advantages, strict=True):
+      try:
+        self._trajectory_store.update_metrics(
+            item.traj_id,
+            _build_consumed_trajectory_metrics(
+                item,
+                mode=self.mode,
+                log_step=log_step,
+                consumed_policy_version=consumed_policy_version,
+                advantage=advantage,
+                step_stage_times=step_stage_times,
+            ),
+        )
+      except Exception:  # pylint: disable=broad-exception-caught
+        logging.warning(
+            "Failed to log metrics for trajectory %s to TrajectoryStore.",
+            item.traj_id,
+            exc_info=True,
+        )
+    for group in filtered_groups:
+      for item in group:
+        try:
+          rollout_version = (
               trajectory_queue_manager.item_policy_version(item)
               if trajectory_queue_manager.has_policy_version(item)
               else None
-          ),
-          "status": status or "UNKNOWN",
-          "reward": float(reward) if reward is not None else None,
-          "question": metadata.get("question", ""),
-          "prompt": _extract_rollout_prompt(
-              metadata, traj.get("conversation_text")
-          ),
-          "completion": _format_rollout_completion(
-              traj.get("conversation_text", "")
-          ),
-          "gold_answer": metadata.get(
-              "gold_answer", metadata.get("answer", "")
-          ),
-          "prompt_tokens": getattr(item, "prompt_tokens", None),
-          "completion_tokens": getattr(item, "completion_tokens", None),
-          "metadata": metadata,
-          "trajectory": traj,
-      }
-      self.trajectory_logger.log_item_async(row)
+          )
+          self._trajectory_store.update_metrics(
+              item.traj_id,
+              trajectory_lib.TrajectoryMetrics(
+                  extra={
+                      "mode": str(self.mode),
+                      "global_step": log_step,
+                      "consumed_policy_version": consumed_policy_version,
+                      "rollout_policy_version": rollout_version,
+                      "prompt_id": str(item.prompt_id),
+                      "group_index": item.group_index,
+                      "consumed": False,
+                      "drop_reason": "stale",
+                  }
+              ),
+          )
+        except Exception:  # pylint: disable=broad-exception-caught
+          logging.warning(
+              "Failed to log drop metrics for trajectory %s to"
+              " TrajectoryStore.",
+              item.traj_id,
+              exc_info=True,
+          )
 
   async def _timed_train_step(
       self, batch: datatypes.RLTrainerPayload, *, apply_optimizer: bool
@@ -1568,6 +1559,7 @@ class StandardRLProgram(RLProgram):
         trainer_metrics = None
         step_sampler_agreement: dict[str, tuple[Any, list[Any]]] = {}
         step_advantages: list[float] = []
+        step_item_advantages: list[float | None] = []
         step_prompt_lengths: list[int] = []
         step_completion_lengths: list[int] = []
         num_microbatches = 0
@@ -1696,9 +1688,12 @@ class StandardRLProgram(RLProgram):
                 strict=True,
             ):
               advantages = np.asarray(payload.advantages)
+              adv_val = None
               if advantages.size > 0:
-                step_advantages.append(float(np.mean(advantages)))
-              del advantages
+                adv_val = float(np.mean(advantages))
+                step_advantages.append(adv_val)
+              step_item_advantages.append(adv_val)
+              del advantages, adv_val
               step_prompt_lengths.append(
                   int(np.count_nonzero(payload.prompt_mask))
               )
@@ -1834,12 +1829,15 @@ class StandardRLProgram(RLProgram):
             step_times=step_times,
             reward_log_metrics=step_reward_log_metrics,
         )
-        del filtered_groups
         self._log_consumed_trajectories(
             all_step_items,
             log_step=current_step,
             consumed_policy_version=consumed_policy_version,
+            item_advantages=step_item_advantages,
+            step_times=step_times,
+            filtered_groups=filtered_groups,
         )
+        del filtered_groups
 
         self.last_step_result = RLStepResult(
             step=current_step,
