@@ -15,8 +15,9 @@
 """Trajectory Collector Engine wrapping TrajectoryCollectEngine with pause/resume/cancel control."""
 
 import asyncio
+import inspect
 import time
-from typing import Any, Callable, Collection, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Collection, Coroutine, List, Mapping, Optional, Sequence
 from absl import logging
 import numpy as np
 from tunix.dist_rl.common import datatypes
@@ -76,6 +77,44 @@ def response_budget_facts(
   return min(raw_length, max_response_length), clipped
 
 
+_BACKGROUND_ENV_CLOSES: set[asyncio.Task[Any]] = set()
+
+
+async def shield_env_close(coro: Coroutine[Any, Any, Any]) -> None:
+  """Runs `coro` to completion even if the awaiting task is cancelled."""
+  task = asyncio.create_task(coro)
+  _BACKGROUND_ENV_CLOSES.add(task)
+  task.add_done_callback(_BACKGROUND_ENV_CLOSES.discard)
+  await asyncio.shield(task)
+
+
+_ENV_CLOSE_TIMEOUT_S: float = 150.0
+
+
+async def close_env_client(
+    env_client: Any, timeout_s: float = _ENV_CLOSE_TIMEOUT_S
+) -> None:
+  """Closes `env_client` off the event loop within `timeout_s` seconds."""
+  close_fn = getattr(env_client, "close", None)
+  if not callable(close_fn):
+    return
+  try:
+    coro = (
+        close_fn()
+        if inspect.iscoroutinefunction(close_fn)
+        else asyncio.to_thread(close_fn)
+    )
+    res = await asyncio.wait_for(coro, timeout=timeout_s)
+    if inspect.isawaitable(res):
+      await asyncio.wait_for(res, timeout=timeout_s)
+  except Exception:  # pylint: disable=broad-exception-caught
+    logging.warning(
+        "Failed to close unclaimed rollout environment %r.",
+        env_client,
+        exc_info=True,
+    )
+
+
 class TrajectoryCollectorEngine:
   """Wrapper around TrajectoryCollectEngine providing lifecycle controls and Trajectory conversion."""
 
@@ -115,6 +154,8 @@ class TrajectoryCollectorEngine:
     self.request = request
     self.sampler = sampler
     self.env = env_client
+    self._env_owned_by_inner: bool = False
+    self._env_close_task: asyncio.Task[None] | None = None
     self.agent = agent
     self.tokenizer = tokenizer
     self.chat_parser = chat_parser
@@ -174,8 +215,21 @@ class TrajectoryCollectorEngine:
             exc_info=True,
         )
 
+  async def close_unclaimed_env(self) -> None:
+    """Closes `self.env` at most once if `TrajectoryCollectEngine` never claimed it."""
+    if self._env_owned_by_inner:
+      return
+    if self._env_close_task is None:
+      self._env_close_task = asyncio.create_task(close_env_client(self.env))
+      _BACKGROUND_ENV_CLOSES.add(self._env_close_task)
+      self._env_close_task.add_done_callback(_BACKGROUND_ENV_CLOSES.discard)
+    await asyncio.shield(self._env_close_task)
+
   async def run_episode(self) -> agent_types.TrajectoryItem:
     """Executes multi-turn agentic rollout episode and returns TrajectoryItem."""
+    if self.is_cancelled:
+      await self.close_unclaimed_env()
+      raise asyncio.CancelledError("Rollout episode was cancelled.")
     self._episode_cache_salt = None
     sampler_time_s = 0.0
 
@@ -187,84 +241,92 @@ class TrajectoryCollectorEngine:
     ):
       del env
       nonlocal sampler_time_s
-      await self._unpaused.wait()
-      generation_kwargs = dict(self.request.generation_kwargs)
-      # NB: extra kwargs can be passed in from trajectory_collect_engine.
-      generation_kwargs.update(kwargs)
-      prompt_token_ids = generation_kwargs.pop("prompt_token_ids", None)
-      request_max_generation_steps = generation_kwargs.pop(
-          "max_generation_steps", None
-      )
-      req_max_tokens = (
-          request_max_generation_steps
-          if request_max_generation_steps is not None
-          else generation_kwargs.get("max_tokens")
-      )
-
-      if max_generation_steps is not None and req_max_tokens is not None:
-        effective_max_tokens = min(max_generation_steps, req_max_tokens)
-      elif max_generation_steps is not None:
-        effective_max_tokens = max_generation_steps
-      elif req_max_tokens is not None:
-        effective_max_tokens = req_max_tokens
-      else:
-        raise ValueError(
-            "TrajectoryCollectorEngine requires"
-            " request.max_response_length, request.generation_kwargs"
-            " ('max_generation_steps' or 'max_tokens'), or the model_call"
-            " callback to specify max_generation_steps."
+      try:
+        await self._unpaused.wait()
+        if self.is_cancelled:
+          raise asyncio.CancelledError("Rollout episode was cancelled.")
+        generation_kwargs = dict(self.request.generation_kwargs)
+        # NB: extra kwargs can be passed in from trajectory_collect_engine.
+        generation_kwargs.update(kwargs)
+        prompt_token_ids = generation_kwargs.pop("prompt_token_ids", None)
+        request_max_generation_steps = generation_kwargs.pop(
+            "max_generation_steps", None
+        )
+        req_max_tokens = (
+            request_max_generation_steps
+            if request_max_generation_steps is not None
+            else generation_kwargs.get("max_tokens")
         )
 
-      generation_kwargs["max_tokens"] = effective_max_tokens
+        if max_generation_steps is not None and req_max_tokens is not None:
+          effective_max_tokens = min(max_generation_steps, req_max_tokens)
+        elif max_generation_steps is not None:
+          effective_max_tokens = max_generation_steps
+        elif req_max_tokens is not None:
+          effective_max_tokens = req_max_tokens
+        else:
+          raise ValueError(
+              "TrajectoryCollectorEngine requires"
+              " request.max_response_length, request.generation_kwargs"
+              " ('max_generation_steps' or 'max_tokens'), or the model_call"
+              " callback to specify max_generation_steps."
+          )
 
-      seed = generation_kwargs.get("seed", None)
+        generation_kwargs["max_tokens"] = effective_max_tokens
 
-      req_policy_version = int(self.request.target_policy_version or 0)
-      turn_policy_version = (
-          max(req_policy_version, int(self._policy_version_fn()))
-          if self._policy_version_fn is not None
-          else req_policy_version
-      )
-      if self._inner_engine is not None:
-        self._inner_engine.policy_version = turn_policy_version
+        seed = generation_kwargs.get("seed", None)
 
-      cache_salt = generation_kwargs.pop("cache_salt", None)
-      if self.partial_rollout:
-        if self._episode_cache_salt is None:
-          self._episode_cache_salt = f"policy_v{turn_policy_version}"
-        if cache_salt is None:
-          cache_salt = self._episode_cache_salt
+        req_policy_version = int(self.request.target_policy_version or 0)
+        turn_policy_version = (
+            max(req_policy_version, int(self._policy_version_fn()))
+            if self._policy_version_fn is not None
+            else req_policy_version
+        )
+        if self._inner_engine is not None:
+          self._inner_engine.policy_version = turn_policy_version
 
-      sampling_params = sampler_lib.SamplingParams(
-          max_tokens=effective_max_tokens,
-          temperature=generation_kwargs.get("temperature", 0.0),
-          top_p=generation_kwargs.get("top_p", None),
-          top_k=generation_kwargs.get("top_k", None),
-          seed=seed,
-          return_logprobs=generation_kwargs.get("return_logprobs", False),
-          return_routed_experts=generation_kwargs.get(
-              "return_routed_experts", False
-          ),
-          routed_experts_prompt_start=generation_kwargs.get(
-              "routed_experts_prompt_start", 0
-          ),
-          cache_salt=cache_salt,
-      )
-      prompt_payload = (
-          np.asarray(prompt_token_ids, dtype=np.int32)
-          if prompt_token_ids is not None
-          else _build_prompt(self.chat_parser, chat_completions)
-      )
-      sampling_req = sampler_lib.SamplingRequest(
-          request_id=self.traj_id,
-          prompt=prompt_payload,
-          sampling_params=sampling_params,
-      )
-      sample_start = time.perf_counter()
-      try:
-        res = await self.sampler.sample(sampling_req, **generation_kwargs)
-      finally:
-        sampler_time_s += time.perf_counter() - sample_start
+        cache_salt = generation_kwargs.pop("cache_salt", None)
+        if self.partial_rollout:
+          if self._episode_cache_salt is None:
+            self._episode_cache_salt = f"policy_v{turn_policy_version}"
+          if cache_salt is None:
+            cache_salt = self._episode_cache_salt
+
+        sampling_params = sampler_lib.SamplingParams(
+            max_tokens=effective_max_tokens,
+            temperature=generation_kwargs.get("temperature", 0.0),
+            top_p=generation_kwargs.get("top_p", None),
+            top_k=generation_kwargs.get("top_k", None),
+            seed=seed,
+            return_logprobs=generation_kwargs.get("return_logprobs", False),
+            return_routed_experts=generation_kwargs.get(
+                "return_routed_experts", False
+            ),
+            routed_experts_prompt_start=generation_kwargs.get(
+                "routed_experts_prompt_start", 0
+            ),
+            cache_salt=cache_salt,
+        )
+        prompt_payload = (
+            np.asarray(prompt_token_ids, dtype=np.int32)
+            if prompt_token_ids is not None
+            else _build_prompt(self.chat_parser, chat_completions)
+        )
+        sampling_req = sampler_lib.SamplingRequest(
+            request_id=self.traj_id,
+            prompt=prompt_payload,
+            sampling_params=sampling_params,
+        )
+        sample_start = time.perf_counter()
+        try:
+          res = await self.sampler.sample(sampling_req, **generation_kwargs)
+        finally:
+          sampler_time_s += time.perf_counter() - sample_start
+      except asyncio.CancelledError:
+        # Detach `trajectory_store` before `inner_engine.collect()`'s `finally:`
+        # runs if a direct `run_episode()` caller cancels the task mid-turn.
+        self.cancel()
+        raise
       text = res if isinstance(res, str) else getattr(res, "text", str(res))
       tokens = getattr(res, "token_ids", np.array([], dtype=np.int32))
       logprobs = getattr(res, "logprobs", None)
@@ -293,6 +355,7 @@ class TrajectoryCollectorEngine:
       )
 
     if not self.agent or not self.env:
+      await self.close_unclaimed_env()
       raise RuntimeError(
           "RolloutCollector requires valid registered agent and env instances"
           " to run an episode."
@@ -314,6 +377,7 @@ class TrajectoryCollectorEngine:
         routed_experts_num_experts=self.routed_experts_num_experts,
     )
     self._inner_engine = inner_engine
+    self._env_owned_by_inner = True
     rl_traj = await inner_engine.collect(mode="Token")
     self.is_done = True
     return self._convert_to_trajectory(rl_traj, sampler_time_s=sampler_time_s)
@@ -459,16 +523,24 @@ class TrajectoryCollectorEngine:
     self.is_paused = False
     self._unpaused.set()
 
-  def cancel(self) -> None:
-    """Marks the episode as cancelled and persists CANCELLED metadata to the store."""
+  def cancel(self, *, record_metadata: bool = False) -> None:
+    """Marks the episode as cancelled, wakes paused turns, and detaches the store."""
     if self.is_done:
       return
     self.is_cancelled = True
     self.is_done = True
+    self.is_paused = False
+    self._unpaused.set()
     if self.agent is not None:
       self.agent.trajectory.status = agent_types.TrajectoryStatus.CANCELLED
+    # By default (`record_metadata=False`), detach `trajectory_store` without
+    # writing `CANCELLED` metadata so cancelling a superseded attempt during
+    # cross-worker failover never clobbers a newer attempt's metadata in the
+    # shared store. `RolloutManager.cancel_all()` (worker `stop()` teardown)
+    # passes `record_metadata=True` right before closing the store.
     if self._inner_engine is not None:
-      self._inner_engine.record_metadata()
+      if record_metadata:
+        self._inner_engine.record_metadata()
       self._inner_engine.trajectory_store = None
     self.trajectory_store = None
 

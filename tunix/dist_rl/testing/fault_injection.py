@@ -180,7 +180,7 @@ class FaultInjector:
 
 
 def _error_response(
-    exc: Exception, request_id: str | None
+    exc: Exception, request_id: str | None, *, attempt: int = 1
 ) -> remote_execution.ExecutionResponse:
   return remote_execution.ExecutionResponse(
       error_message=str(exc),
@@ -191,6 +191,7 @@ def _error_response(
           else None
       ),
       request_id=request_id,
+      attempt=attempt,
   )
 
 
@@ -270,7 +271,9 @@ class FaultInjectingServer(remote_execution.GrpcRemoteExecutionServer):
       request: remote_execution.ExecutionRequest,
   ) -> remote_execution.ExecutionResponse:
     if isinstance(action, Raise):
-      return _error_response(action.exc, request.request_id)
+      return _error_response(
+          action.exc, request.request_id, attempt=request.attempt
+      )
     elif isinstance(action, Block):
       if not action.after_super:
         await action.gate.wait_async(shield=action.shield)
@@ -283,13 +286,16 @@ class FaultInjectingServer(remote_execution.GrpcRemoteExecutionServer):
       return remote_execution.ExecutionResponse(
           result=action.value,
           request_id=request.request_id,
+          attempt=request.attempt,
       )
     elif isinstance(action, LoseReply):
       _ = await super().execute_request(request)
       context = _CURRENT_GRPC_CONTEXT.get()
       if context is not None:
         await context.abort(grpc.StatusCode.UNAVAILABLE, str(action.exc))
-      return _error_response(action.exc, request.request_id)
+      return _error_response(
+          action.exc, request.request_id, attempt=request.attempt
+      )
     raise TypeError(f"Unsupported fault action: {action!r}")
 
 

@@ -46,6 +46,7 @@ class MockActorHandle(mock.MagicMock):
   def __init__(self, *args, **kwargs):
     super().__init__(spec=remote_execution.ActorHandle, *args, **kwargs)
     self._dispatched_request_ids: collections.deque[str] = collections.deque()
+    self._dispatched_attempts: dict[str, int] = {}
 
     # Ensure all mocked methods return awaitables by default
     async def _poll_impl(
@@ -61,11 +62,14 @@ class MockActorHandle(mock.MagicMock):
           if self._dispatched_request_ids
           else ""
       )
+      attempt = self._dispatched_attempts.pop(req_id, 1) if req_id else 1
       if isinstance(val, remote_execution.ExecutionResponse):
         if not val.request_id and req_id:
           val.request_id = req_id
         return val
-      return remote_execution.ExecutionResponse(request_id=req_id, result=val)
+      return remote_execution.ExecutionResponse(
+          request_id=req_id, result=val, attempt=attempt
+      )
 
     self.generate = mock.AsyncMock()
     self.poll_responses = mock.AsyncMock(
@@ -113,6 +117,9 @@ class MockActorHandle(mock.MagicMock):
       method_name = request_id
     if request_id is not None:
       self._dispatched_request_ids.append(request_id)
+      self._dispatched_attempts[request_id] = int(
+          kwargs.get("session_attempt", 1)
+      )
     method = getattr(self, method_name)
     await method(*args, **kwargs)
     return request_id
@@ -2264,6 +2271,12 @@ class DistributedRLEngineTest(absltest.TestCase):
       self.assertNotIn("rollout-0", engine._registry)
       self.mock_rollout_1.sync_close.assert_called_once()
       self.assertEqual(self.mock_rollout_2.generate.call_count, 1)
+      self.assertEqual(
+          self.mock_rollout_1.generate.call_args.kwargs["session_attempt"], 1
+      )
+      self.assertEqual(
+          self.mock_rollout_2.generate.call_args.kwargs["session_attempt"], 2
+      )
       await engine.close()
 
     asyncio.run(_run())
@@ -2305,6 +2318,12 @@ class DistributedRLEngineTest(absltest.TestCase):
       self.mock_rollout_1.sync_close.assert_called_once()
       self.assertEqual(self.mock_rollout_1.generate.call_count, 1)
       self.assertEqual(self.mock_rollout_2.generate.call_count, 1)
+      self.assertEqual(
+          self.mock_rollout_1.generate.call_args.kwargs["session_attempt"], 1
+      )
+      self.assertEqual(
+          self.mock_rollout_2.generate.call_args.kwargs["session_attempt"], 2
+      )
 
       results = await self.engine.poll_rollouts(timeout_s=0.5)
       self.assertLen(results, 1)
@@ -2343,6 +2362,7 @@ class DistributedRLEngineTest(absltest.TestCase):
       self.assertEqual(engine._rollout_session._poll_retry_budget_s, 300.0)
       self.assertEqual(engine._rollout_session._max_task_retries, 0)
       self.assertIsNone(engine._rollout_session._on_worker_unreachable)
+      self.assertTrue(engine._rollout_session._pass_session_attempt)
       await engine.close()
 
       self.assertEqual(
@@ -2921,11 +2941,12 @@ class DistributedRLEngineTest(absltest.TestCase):
 
       w1_q: asyncio.Queue[remote_execution.ExecutionResponse] = asyncio.Queue()
 
-      async def _w1_generate(*, requests):
+      async def _w1_generate(*, requests, session_attempt: int = 1):
         req = requests[0]
         w1_q.put_nowait(
             remote_execution.ExecutionResponse(
                 request_id=req.request_id,
+                attempt=session_attempt,
                 result=[
                     datatypes.RolloutResponse(
                         request_id=req.request_id,
@@ -3020,9 +3041,11 @@ class DistributedRLEngineTest(absltest.TestCase):
       handle = workers[worker_idx]
       for _ in range(count):
         req_id = handle._dispatched_request_ids.popleft()
+        attempt = handle._dispatched_attempts.pop(req_id, 1)
         queues[worker_idx].put_nowait(
             remote_execution.ExecutionResponse(
                 request_id=req_id,
+                attempt=attempt,
                 result=[
                     datatypes.RolloutResponse(
                         request_id=req_id,
@@ -3390,11 +3413,13 @@ class DistributedRLEngineTest(absltest.TestCase):
             handle: MockActorHandle,
             q: asyncio.Queue[remote_execution.ExecutionResponse],
         ) -> None:
-          async def _generate(*, requests):
+
+          async def _generate(*, requests, session_attempt: int = 1):
             req = requests[0]
             q.put_nowait(
                 remote_execution.ExecutionResponse(
                     request_id=req.request_id,
+                    attempt=session_attempt,
                     result=[
                         datatypes.RolloutResponse(
                             request_id=req.request_id,

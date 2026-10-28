@@ -38,6 +38,7 @@ import asyncio
 import concurrent.futures
 import contextlib
 import contextvars
+import dataclasses
 import functools
 import inspect
 import pickle
@@ -132,6 +133,38 @@ def _client_supports_bulk(context: Any) -> bool:
   return False
 
 
+def validate_positive_int(value: Any, name: str) -> int:
+  """Validates that `value` is a positive `int` (rejecting `bool`)."""
+  if isinstance(value, bool) or not isinstance(value, int):
+    raise TypeError(f"{name} must be an int, got {type(value).__name__}.")
+  if value < 1:
+    raise ValueError(f"{name} must be >= 1, got {value}.")
+  return value
+
+
+@dataclasses.dataclass(slots=True)
+class _InFlightExecution:
+  """Server-side tracking entry for an active or unpolled `dispatch_task` run."""
+
+  attempt: int
+  prior_tasks: Tuple[asyncio.Task[None], ...] = ()
+  task: Optional[asyncio.Task[None]] = None
+  superseded: bool = False
+
+  def supersede(self) -> Tuple[asyncio.Task[None], ...]:
+    """Marks `self` superseded, cancels `task`, and returns live priors."""
+    self.superseded = True
+    if self.task is not None and not self.task.done():
+      self.task.cancel()
+    seen_ids: Set[int] = set()
+    priors_list: List[asyncio.Task[None]] = []
+    for prior in (*self.prior_tasks, self.task):
+      if prior is not None and not prior.done() and id(prior) not in seen_ids:
+        seen_ids.add(id(prior))
+        priors_list.append(prior)
+    return tuple(priors_list)
+
+
 class ExecutionRequest:
   """Universal execution request payload wrapping request_id, method name, args, and kwargs."""
 
@@ -141,6 +174,7 @@ class ExecutionRequest:
       method_name: Optional[str] = None,
       args: Optional[Sequence[Any]] = None,
       kwargs: Optional[Dict[str, Any]] = None,
+      attempt: Optional[int] = None,
   ):
     self.request_id = request_id
     self.method_name = method_name or "__call__"
@@ -151,9 +185,40 @@ class ExecutionRequest:
           "'request_id' is a reserved framework parameter for remote execution "
           "and cannot be passed in method kwargs."
       )
+    kw_attempt = (
+        validate_positive_int(self.kwargs["session_attempt"], "session_attempt")
+        if "session_attempt" in self.kwargs
+        else None
+    )
+    req_attempt = (
+        None if attempt is None else validate_positive_int(attempt, "attempt")
+    )
+    if (
+        req_attempt is not None
+        and kw_attempt is not None
+        and req_attempt != kw_attempt
+    ):
+      raise ValueError(
+          f"ExecutionRequest attempt={req_attempt} conflicts with"
+          f" kwargs['session_attempt']={kw_attempt}."
+      )
+    self.attempt: int = req_attempt or kw_attempt or 1
 
   def _as_tuple(self) -> Tuple[Any, ...]:
-    return (self.request_id, self.method_name, self.args, self.kwargs)
+    # Emit the legacy 4-tuple on the common path (`attempt == 1` or when
+    # `kwargs['session_attempt']` already carries the attempt index) so older
+    # workers on mixed-version clusters deserialize standard dispatches without
+    # requiring a 5-element tuple, while standalone `ExecutionRequest(...,
+    # attempt=k)` callers with `k > 1` still round-trip losslessly.
+    if self.attempt == 1 or "session_attempt" in self.kwargs:
+      return (self.request_id, self.method_name, self.args, self.kwargs)
+    return (
+        self.request_id,
+        self.method_name,
+        self.args,
+        self.kwargs,
+        self.attempt,
+    )
 
   def serialize_chunks(
       self,
@@ -228,6 +293,7 @@ class ExecutionResponse:
       retryable: bool = False,
       request_id: Optional[str] = None,
       ack_id: Optional[int] = None,
+      attempt: int = 1,
   ):
     self.result = result
     self.error_message = error_message
@@ -236,8 +302,24 @@ class ExecutionResponse:
     self.retryable = retryable
     self.request_id = request_id
     self.ack_id = ack_id
+    self.attempt: int = validate_positive_int(attempt, "attempt")
+    self._origin_entry: Optional[_InFlightExecution] = None
 
   def _as_tuple(self) -> Tuple[Any, ...]:
+    """Returns wire tuple (7-tuple when `attempt == 1`, 8-tuple when `> 1`)."""
+    # Emit the legacy 7-tuple when `attempt == 1` so older pollers on
+    # mixed-version clusters deserialize first-attempt responses unchanged, and
+    # append `attempt` as an 8th element only on retried attempts (`> 1`).
+    if self.attempt == 1:
+      return (
+          self.result,
+          self.error_message,
+          self.error_type,
+          self.traceback,
+          self.retryable,
+          self.request_id,
+          self.ack_id,
+      )
     return (
         self.result,
         self.error_message,
@@ -246,6 +328,7 @@ class ExecutionResponse:
         self.retryable,
         self.request_id,
         self.ack_id,
+        self.attempt,
     )
 
   def _record_serialization_error(self, e: Exception) -> None:
@@ -382,10 +465,14 @@ class RemoteExecutionServer(abc.ABC):
     self._response_queue: Optional[asyncio.Queue[ExecutionResponse]] = None
     self._request_counter: int = 0
     # Request IDs accepted by `dispatch_task` whose response has not yet been
-    # delivered to a poller, mapped to their execution task; a duplicate
-    # dispatch of one of these (a client retry after a lost ACK) is
-    # acknowledged without executing it again.
-    self._in_flight_requests: Dict[str, asyncio.Task[None]] = {}
+    # delivered to a poller, mapped to their active `_InFlightExecution`:
+    # - `attempt == existing.attempt`: deduplicate in-place client retry;
+    # - `attempt < existing.attempt`: ignore stale out-of-order retry;
+    # - `attempt > existing.attempt`: cancel/supersede `existing`, drain prior
+    #   tasks, and run the newer attempt.
+    # Entries are removed once delivered (or aborted without response), leaving
+    # zero post-completion tombstones so multi-epoch ID reuse works unchanged.
+    self._in_flight_requests: Dict[str, _InFlightExecution] = {}
     self._background_tasks: set[asyncio.Task[Any]] = set()
     self._sync_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
     self._sync_executor_lock = threading.Lock()
@@ -431,39 +518,73 @@ class RemoteExecutionServer(abc.ABC):
       self._response_queue = asyncio.Queue()
     return self._response_queue
 
+  def _purge_superseded_responses(
+      self, req_id: str, *, max_stale_attempt: int
+  ) -> None:
+    """Removes buffered responses for `req_id` with `attempt <= max_stale_attempt`."""
+    if self._response_queue is None or self._response_queue.empty():
+      return
+    retained: List[ExecutionResponse] = []
+    while not self._response_queue.empty():
+      resp = self._response_queue.get_nowait()
+      if not (resp.request_id == req_id and resp.attempt <= max_stale_attempt):
+        retained.append(resp)
+    for resp in retained:
+      self._response_queue.put_nowait(resp)
+
   async def dispatch_task(self, request: ExecutionRequest) -> str:
     """Dispatches task execution asynchronously on server and returns task ACK ID."""
     if not request.request_id:
       self._request_counter += 1
       request.request_id = f"task_{self._request_counter}"
     req_id = request.request_id
-    if req_id in self._in_flight_requests:
-      logging.debug(
-          "[RemoteExecutionServer] Deduplicating in-flight dispatch for"
-          " request_id=%s",
-          req_id,
+    existing = self._in_flight_requests.get(req_id)
+    live_priors: Tuple[asyncio.Task[None], ...] = ()
+    if existing is not None:
+      if request.attempt <= existing.attempt:
+        logging.debug(
+            "[RemoteExecutionServer] Ignoring duplicate/stale dispatch for"
+            " request_id=%s (attempt=%d vs active attempt=%d)",
+            req_id,
+            request.attempt,
+            existing.attempt,
+        )
+        return req_id
+      live_priors = existing.supersede()
+
+    if request.attempt > 1:
+      self._purge_superseded_responses(
+          req_id, max_stale_attempt=request.attempt - 1
       )
-      return req_id
-    task = asyncio.create_task(self._run_and_enqueue(request))
-    self._in_flight_requests[req_id] = task
+
+    # Install `entry` synchronously before `create_task` so rapid burst retries
+    # (`attempt 1 -> 2 -> 3`) chain deterministically and mark intermediate
+    # entries `superseded=True` before their coroutines ever invoke work.
+    entry = _InFlightExecution(attempt=request.attempt, prior_tasks=live_priors)
+    self._in_flight_requests[req_id] = entry
+    task = asyncio.create_task(self._run_and_enqueue(entry, request))
+    entry.task = task
     self._background_tasks.add(task)
     task.add_done_callback(self._background_tasks.discard)
     task.add_done_callback(
-        functools.partial(self._release_unanswered_request, req_id)
+        functools.partial(self._release_unanswered_request, req_id, entry)
     )
     return req_id
 
   def _release_unanswered_request(
-      self, req_id: str, task: asyncio.Task[None]
+      self,
+      req_id: str,
+      entry: _InFlightExecution,
+      task: asyncio.Task[None],
   ) -> None:
-    """Forgets `req_id` if its task ended without enqueuing a response."""
-    if task.cancelled():
-      if self._in_flight_requests.get(req_id) is task:
+    """Forgets `req_id` if `entry`'s task ended without enqueuing a response."""
+    if task.cancelled() or entry.superseded:
+      if self._in_flight_requests.get(req_id) is entry:
         self._in_flight_requests.pop(req_id, None)
       return
     exc = task.exception()
     if exc is not None:
-      if self._in_flight_requests.get(req_id) is task:
+      if self._in_flight_requests.get(req_id) is entry:
         self._in_flight_requests.pop(req_id, None)
       logging.error(
           "[RemoteExecutionServer] Task %s failed without a response: %r",
@@ -471,13 +592,31 @@ class RemoteExecutionServer(abc.ABC):
           exc,
       )
 
-  async def _run_and_enqueue(self, request: ExecutionRequest) -> None:
+  async def _drain_prior_tasks(self, entry: _InFlightExecution) -> bool:
+    """Awaits `entry.prior_tasks` and returns False if `entry` was superseded."""
+    live = [asyncio.shield(p) for p in entry.prior_tasks if not p.done()]
+    if live:
+      await asyncio.gather(*live, return_exceptions=True)
+    curr = asyncio.current_task()
+    if curr is not None and curr.cancelling() > 0:
+      raise asyncio.CancelledError()
+    return not entry.superseded
+
+  async def _run_and_enqueue(
+      self, entry: _InFlightExecution, request: ExecutionRequest
+  ) -> None:
+    """Drains superseded prior tasks, runs `request`, and queues its response."""
+    if not await self._drain_prior_tasks(entry):
+      return
     logging.debug(
-        "[RemoteExecutionServer] Starting task %s method=%s",
+        "[RemoteExecutionServer] Starting task %s method=%s attempt=%d",
         request.request_id,
         request.method_name,
+        request.attempt,
     )
     response = await self.execute_request(request)
+    if entry.superseded:
+      return
     if response.error_message:
       logging.debug(
           "[RemoteExecutionServer] Task %s failed: %s\n%s",
@@ -490,20 +629,31 @@ class RemoteExecutionServer(abc.ABC):
           "[RemoteExecutionServer] Task %s finished successfully",
           request.request_id,
       )
-    await self._get_response_queue().put(response)
+    response._origin_entry = entry  # pylint: disable=protected-access
+    self._get_response_queue().put_nowait(response)
 
   async def _dequeue_response(
       self, timeout_s: float = LONG_POLL_TIMEOUT_S
   ) -> Optional[ExecutionResponse]:
-    """Dequeues the next completed response, or returns `None` on timeout."""
-    try:
-      if timeout_s == 0.0:
-        return self._get_response_queue().get_nowait()
-      return await asyncio.wait_for(
-          self._get_response_queue().get(), timeout=timeout_s
-      )
-    except (asyncio.TimeoutError, asyncio.QueueEmpty):
-      return None
+    """Dequeues the next non-superseded response, or `None` on timeout."""
+    # A response handed directly to a waiting `Queue.get()` future bypasses
+    # `_purge_superseded_responses` if a superseding `dispatch_task` runs before
+    # the poller resumes; loop and discard any entry marked `superseded`.
+    queue = self._get_response_queue()
+    deadline = time.monotonic() + timeout_s
+    while True:
+      rem = 0.0 if timeout_s == 0.0 else max(0.0, deadline - time.monotonic())
+      try:
+        resp = (
+            queue.get_nowait()
+            if rem == 0.0
+            else await asyncio.wait_for(queue.get(), timeout=rem)
+        )
+      except (asyncio.TimeoutError, asyncio.QueueEmpty):
+        return None
+      orig = resp._origin_entry  # pylint: disable=protected-access
+      if orig is None or not orig.superseded:
+        return resp
 
   async def poll_response(
       self, timeout_s: float = LONG_POLL_TIMEOUT_S
@@ -511,7 +661,12 @@ class RemoteExecutionServer(abc.ABC):
     """Long-polls server-side response queue for completed task results."""
     response = await self._dequeue_response(timeout_s=timeout_s)
     if response is not None and response.request_id:
-      self._in_flight_requests.pop(response.request_id, None)
+      orig = response._origin_entry  # pylint: disable=protected-access
+      cur = self._in_flight_requests.get(response.request_id)
+      if cur is orig or (
+          orig is None and cur is not None and cur.attempt == response.attempt
+      ):
+        self._in_flight_requests.pop(response.request_id, None)
     return response
 
   def register_instance(self, instance: Any) -> None:
@@ -537,6 +692,7 @@ class RemoteExecutionServer(abc.ABC):
           error_message="RemoteExecutionServer has no registered instance.",
           error_type="InstanceNotBoundError",
           request_id=request.request_id,
+          attempt=request.attempt,
       )
 
     target_name = request.method_name or "__call__"
@@ -546,6 +702,7 @@ class RemoteExecutionServer(abc.ABC):
           error_message=f"Method '{target_name}' not found on bound instance.",
           error_type="AttributeError",
           request_id=request.request_id,
+          attempt=request.attempt,
       )
 
     if inspect.iscoroutinefunction(method):
@@ -555,17 +712,23 @@ class RemoteExecutionServer(abc.ABC):
           ),
           error_type="RuntimeError",
           request_id=request.request_id,
+          attempt=request.attempt,
       )
 
     try:
       result = method(*request.args, **request.kwargs)
-      return ExecutionResponse(result=result, request_id=request.request_id)
+      return ExecutionResponse(
+          result=result,
+          request_id=request.request_id,
+          attempt=request.attempt,
+      )
     except Exception as e:  # pylint: disable=broad-exception-caught
       return ExecutionResponse(
           error_message=str(e),
           error_type=type(e).__name__,
           traceback=traceback_lib.format_exc(),
           request_id=request.request_id,
+          attempt=request.attempt,
       )
 
   async def _invoke_method(
@@ -599,6 +762,7 @@ class RemoteExecutionServer(abc.ABC):
           error_message="RemoteExecutionServer has no registered instance.",
           error_type="InstanceNotBoundError",
           request_id=request.request_id,
+          attempt=request.attempt,
       )
 
     target_name = request.method_name or "__call__"
@@ -608,17 +772,23 @@ class RemoteExecutionServer(abc.ABC):
           error_message=f"Method '{target_name}' not found on bound instance.",
           error_type="AttributeError",
           request_id=request.request_id,
+          attempt=request.attempt,
       )
 
     try:
       result = await self._invoke_method(method, request.args, request.kwargs)
-      return ExecutionResponse(result=result, request_id=request.request_id)
+      return ExecutionResponse(
+          result=result,
+          request_id=request.request_id,
+          attempt=request.attempt,
+      )
     except Exception as e:  # pylint: disable=broad-exception-caught
       return ExecutionResponse(
           error_message=str(e),
           error_type=type(e).__name__,
           traceback=traceback_lib.format_exc(),
           request_id=request.request_id,
+          attempt=request.attempt,
       )
 
 
@@ -690,7 +860,7 @@ class GrpcRemoteExecutionServer(RemoteExecutionServer):
     self._configured_bulk_port = bulk_port
     # Sent responses kept until the active poll client acknowledges `ack_id`.
     self._unacked_responses: Dict[
-        int, Tuple[ExecutionResponse, Optional[asyncio.Task[None]]]
+        int, Tuple[ExecutionResponse, Optional[_InFlightExecution]]
     ] = {}
     self._poll_client_id: str = ""
     self._next_ack_id: int = 0
@@ -698,12 +868,12 @@ class GrpcRemoteExecutionServer(RemoteExecutionServer):
   def _release_in_flight(
       self,
       response: ExecutionResponse,
-      orig_task: Optional[asyncio.Task[None]],
+      orig_entry: Optional[_InFlightExecution],
   ) -> None:
     if (
-        orig_task is not None
+        orig_entry is not None
         and response.request_id
-        and self._in_flight_requests.get(response.request_id) is orig_task
+        and self._in_flight_requests.get(response.request_id) is orig_entry
     ):
       self._in_flight_requests.pop(response.request_id, None)
 
@@ -713,9 +883,25 @@ class GrpcRemoteExecutionServer(RemoteExecutionServer):
       self._release_in_flight(*popped)
 
   def _clear_unacked(self) -> None:
-    for response, orig_task in self._unacked_responses.values():
-      self._release_in_flight(response, orig_task)
+    for response, orig_entry in self._unacked_responses.values():
+      self._release_in_flight(response, orig_entry)
     self._unacked_responses.clear()
+
+  def _purge_superseded_responses(
+      self, req_id: str, *, max_stale_attempt: int
+  ) -> None:
+    super()._purge_superseded_responses(
+        req_id, max_stale_attempt=max_stale_attempt
+    )
+    if not self._unacked_responses:
+      return
+    stale_ack_ids = [
+        ack_id
+        for ack_id, (resp, _) in self._unacked_responses.items()
+        if resp.request_id == req_id and resp.attempt <= max_stale_attempt
+    ]
+    for ack_id in stale_ack_ids:
+      self._pop_unacked(ack_id)
 
   def _ack_from_context(self, context: Any) -> None:
     """Drops an acknowledged poll response carried in RPC metadata."""
@@ -755,10 +941,14 @@ class GrpcRemoteExecutionServer(RemoteExecutionServer):
   ) -> AsyncIterator[bytes]:
     """Handles bidirectional chunked streaming execution requests."""
     self._ack_from_context(context)
+    req_id: Optional[str] = None
+    req_attempt: int = 1
     try:
       request = await ExecutionRequest.deserialize_async_chunks(
           request_iterator, bulk_server=self._bulk_server
       )
+      req_id = request.request_id
+      req_attempt = request.attempt
       response = await self.execute_request(request)
       del request
     except network._BulkTransportError as exc:  # pylint: disable=protected-access
@@ -768,6 +958,8 @@ class GrpcRemoteExecutionServer(RemoteExecutionServer):
           error_message=str(e),
           error_type=type(e).__name__,
           traceback=traceback_lib.format_exc(),
+          request_id=req_id,
+          attempt=req_attempt,
       )
     use_bulk = self._enable_bulk_transport and _client_supports_bulk(context)
     async for chunk in response.serialize_async_chunks(
@@ -790,6 +982,32 @@ class GrpcRemoteExecutionServer(RemoteExecutionServer):
       await self._abort_failed_precondition(context, exc)
     request_id = await self.dispatch_task(request)
     return cloudpickle.dumps(request_id)
+
+  async def _claim_polled_response(
+      self, timeout_s: float, client_id: str
+  ) -> Optional[Tuple[ExecutionResponse, Optional[_InFlightExecution]]]:
+    """Returns `(response, orig_entry)` to stream, or `None` if empty/stale."""
+    if self._unacked_responses:
+      return next(iter(self._unacked_responses.values()))
+    response = await self._dequeue_response(timeout_s=timeout_s)
+    # Bind `orig_entry` to the exact `_InFlightExecution` that produced
+    # `response` rather than `_in_flight_requests[request_id]`, which may
+    # already point to a newer superseding attempt.
+    orig_entry = None if response is None else response._origin_entry  # pylint: disable=protected-access
+    if response is None or (orig_entry is not None and orig_entry.superseded):
+      return None
+    if client_id != self._poll_client_id:
+      self._get_response_queue().put_nowait(response)
+      return None
+    if orig_entry is None and response.request_id:
+      cand = self._in_flight_requests.get(response.request_id)
+      if cand and cand.attempt == response.attempt and not cand.superseded:
+        orig_entry = cand
+    self._next_ack_id += 1
+    response.ack_id = self._next_ack_id
+    claimed = (response, orig_entry)
+    self._unacked_responses[response.ack_id] = claimed
+    return claimed
 
   async def _handle_poll_responses(
       self, request_bytes: bytes, context: Any
@@ -821,23 +1039,10 @@ class GrpcRemoteExecutionServer(RemoteExecutionServer):
       self._clear_unacked()
     elif ack_id is not None:
       self._pop_unacked(ack_id)
-    if self._unacked_responses:
-      _, (response, orig_task) = next(iter(self._unacked_responses.items()))
-    else:
-      response = await self._dequeue_response(timeout_s=timeout_s)
-      if response is None:
-        return
-      if client_id != self._poll_client_id:
-        self._get_response_queue().put_nowait(response)
-        return
-      orig_task = (
-          self._in_flight_requests.get(response.request_id)
-          if response.request_id
-          else None
-      )
-      self._next_ack_id += 1
-      response.ack_id = self._next_ack_id
-      self._unacked_responses[response.ack_id] = (response, orig_task)
+    claimed = await self._claim_polled_response(timeout_s, client_id)
+    if claimed is None:
+      return
+    response, orig_entry = claimed
     # pylint: disable=protected-access
     poll_chunk_bytes = min(
         self._stream_chunk_bytes, network._CONCURRENT_STREAM_CHUNK_BYTES
@@ -852,7 +1057,7 @@ class GrpcRemoteExecutionServer(RemoteExecutionServer):
         yield chunk
       # Release `_in_flight_requests` once streamed so reused `request_id`s can
       # execute again while `_unacked_responses` retains the payload until ACK.
-      self._release_in_flight(response, orig_task)
+      self._release_in_flight(response, orig_entry)
     finally:
       network._dec_active_poll_rpcs()
     # pylint: enable=protected-access

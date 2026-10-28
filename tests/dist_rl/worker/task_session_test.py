@@ -2817,6 +2817,184 @@ class TaskSessionTest(parameterized.TestCase):
 
     asyncio.run(_run())
 
+  def test_task_session_pass_session_attempt_validation_and_retry_increments(
+      self,
+  ):
+    class RecordingAttemptHandle(remote_lib.ActorHandle):
+
+      def __init__(
+          self,
+          name: str,
+          *,
+          fail_dispatch: bool = False,
+          fail_poll: bool = False,
+      ):
+        self.name = name
+        self._fail_dispatch = fail_dispatch
+        self._fail_poll = fail_poll
+        self._queue: asyncio.Queue[remote_lib.ExecutionResponse] = (
+            asyncio.Queue()
+        )
+        self.observed_kwargs: list[dict[str, Any]] = []
+
+      def submit(self, method_name=None, *args, **kwargs):
+        raise NotImplementedError()
+
+      async def asubmit(self, method_name=None, *args, **kwargs):
+        raise NotImplementedError()
+
+      async def dispatch_task(
+          self, request_id=None, method_name=None, *args, **kwargs
+      ) -> str:
+        del method_name, args
+        self.observed_kwargs.append(dict(kwargs))
+        if self._fail_dispatch:
+          raise ConnectionError(f"{self.name} dispatch failed")
+        if not self._fail_poll:
+          await self._queue.put(
+              remote_lib.ExecutionResponse(
+                  request_id=request_id,
+                  result=(self.name, kwargs["session_attempt"]),
+                  attempt=kwargs["session_attempt"],
+              )
+          )
+        return request_id or ""
+
+      async def poll_responses(self, timeout_s=50.0):
+        if self._fail_poll:
+          await asyncio.sleep(0.005)
+          raise ConnectionError(f"{self.name} poll failed")
+        return await asyncio.wait_for(self._queue.get(), timeout=timeout_s)
+
+    async def _run():
+      w1 = RecordingAttemptHandle("w1", fail_dispatch=True)
+      w2 = RecordingAttemptHandle("w2", fail_poll=True)
+      w3 = RecordingAttemptHandle("w3")
+      live_actors: list[remote_lib.ActorHandle] = [w1, w2, w3]
+
+      def _on_unreachable(actor, exc):
+        del exc
+        if actor in live_actors:
+          live_actors.remove(actor)
+
+      async with task_session.TaskSession(
+          lambda: list(live_actors),
+          route_fn=lambda actors, key: actors[0],
+          fault_tolerance_config=task_session.TaskSessionFaultToleranceConfig(
+              max_task_retries=2,
+              on_worker_unreachable=_on_unreachable,
+          ),
+          pass_session_attempt=True,
+      ) as session:
+        with self.assertRaisesRegex(ValueError, "session_attempt"):
+          await session.submit(
+              "req_bad",
+              "generate",
+              requests=["r"],
+              session_attempt=1,
+          )
+        self.assertEqual(session._in_flight, 0)
+
+        caller_kwargs = {"requests": ["r1"]}
+        await session.submit("req_1", "generate", **caller_kwargs)
+        self.assertNotIn("session_attempt", caller_kwargs)
+        batch = await session.poll_completed(timeout_s=1.0)
+        self.assertEqual(batch, [(("w3", 3), None)])
+        self.assertEqual(w1.observed_kwargs[0]["session_attempt"], 1)
+        self.assertEqual(w2.observed_kwargs[0]["session_attempt"], 2)
+        self.assertEqual(w3.observed_kwargs[0]["session_attempt"], 3)
+        self.assertEqual(session._in_flight, 0)
+
+    asyncio.run(_run())
+
+  def test_task_session_filters_stale_attempt_responses_and_keeps_in_place_attempt(
+      self,
+  ):
+    class BounceAndInPlaceHandle(remote_lib.ActorHandle):
+
+      def __init__(self, name: str, *, fail_first_poll: bool = False):
+        self.name = name
+        self.fail_first_poll = fail_first_poll
+        self.transient_blips_left = 0
+        self.seen_attempts: list[int] = []
+        self._queue: asyncio.Queue[remote_lib.ExecutionResponse] = (
+            asyncio.Queue()
+        )
+
+      def submit(self, method_name=None, *args, **kwargs):
+        raise NotImplementedError()
+
+      async def asubmit(self, method_name=None, *args, **kwargs):
+        raise NotImplementedError()
+
+      async def dispatch_task(
+          self, request_id=None, method_name=None, *args, **kwargs
+      ) -> str:
+        del method_name, args
+        attempt = int(kwargs.get("session_attempt", 1))
+        self.seen_attempts.append(attempt)
+        if self.transient_blips_left > 0:
+          self.transient_blips_left -= 1
+          raise remote_lib.TransientTransportError("transient blip")
+        if attempt == 3:
+          # Inject a stale attempt-1 response ahead of the real attempt-3
+          # response to verify client-side attempt filtering.
+          self._queue.put_nowait(
+              remote_lib.ExecutionResponse(
+                  request_id=request_id, result="stale_a1", attempt=1
+              )
+          )
+          self._queue.put_nowait(
+              remote_lib.ExecutionResponse(
+                  request_id=request_id, result="fresh_a3", attempt=3
+              )
+          )
+        return request_id or ""
+
+      async def poll_responses(self, timeout_s=50.0):
+        if self.fail_first_poll:
+          self.fail_first_poll = False
+          await asyncio.sleep(0.005)
+          raise ConnectionError(f"{self.name} poll failed")
+        return await asyncio.wait_for(self._queue.get(), timeout=timeout_s)
+
+    async def _run():
+      w0 = BounceAndInPlaceHandle("w0", fail_first_poll=True)
+      w0.transient_blips_left = 1
+      w1 = BounceAndInPlaceHandle("w1", fail_first_poll=True)
+      live_actors: list[remote_lib.ActorHandle] = [w0, w1]
+
+      def _on_unreachable(actor, exc):
+        del exc
+        if actor in live_actors:
+          live_actors.remove(actor)
+        if actor is w1:
+          # Simulate w0 rejoining the pool before attempt 3 routes.
+          live_actors.append(w0)
+
+      async with task_session.TaskSession(
+          lambda: list(live_actors),
+          route_fn=lambda actors, key: actors[0],
+          poll_retry_budget_s=1.0,
+          poll_retry_initial_backoff_s=0.005,
+          poll_retry_max_backoff_s=0.01,
+          fault_tolerance_config=task_session.TaskSessionFaultToleranceConfig(
+              max_task_retries=3,
+              on_worker_unreachable=_on_unreachable,
+          ),
+          pass_session_attempt=True,
+      ) as session:
+        await session.submit("traj_1", "generate", requests=["r"])
+        batch = await session.poll_completed(timeout_s=2.0)
+        self.assertEqual(batch, [("fresh_a3", None)])
+        # In-place retry on w0 kept session_attempt=1; bounce-back used 3.
+        self.assertEqual(w0.seen_attempts, [1, 1, 3])
+        self.assertEqual(w1.seen_attempts, [2])
+        self.assertEqual(session.stale_responses_total, 1)
+        self.assertEqual(session._in_flight, 0)
+
+    asyncio.run(_run())
+
 
 if __name__ == "__main__":
   absltest.main()

@@ -16,6 +16,7 @@
 
 import asyncio
 import collections
+import contextlib
 import dataclasses
 import tempfile
 import threading
@@ -34,7 +35,9 @@ from tunix.dist_rl.common import test_utils as mocks
 from tunix.dist_rl.trajectory import file_store
 from tunix.dist_rl.trajectory import trajectory as trajectory_lib
 from tunix.dist_rl.trajectory import trajectory_testing
+from tunix.dist_rl.worker import remote_execution
 from tunix.dist_rl.worker import rollout_worker
+from tunix.dist_rl.worker import task_session
 
 
 class RolloutWorkerTest(absltest.TestCase):
@@ -427,6 +430,30 @@ class RolloutWorkerTest(absltest.TestCase):
         },
     )
 
+  def test_generate_validates_and_forwards_session_attempt(self):
+    async def _run():
+      req = datatypes.RolloutRequest(
+          request_id="req_attempt",
+          prompt="What is 2+2?",
+          prompt_id="prompt_attempt",
+          group_index=0,
+          generation_kwargs={"max_generation_steps": 64},
+      )
+      for bad_val in (0, -1):
+        with self.assertRaisesRegex(ValueError, "session_attempt"):
+          await self.worker.generate(requests=[], session_attempt=bad_val)
+
+      with mock.patch.object(
+          self.worker.manager,
+          "generate",
+          wraps=self.worker.manager.generate,
+      ) as mgr_gen_mock:
+        resp = await self.worker.generate(requests=req, session_attempt=3)
+        self.assertEqual(resp.status, "COMPLETED")
+        self.assertEqual(mgr_gen_mock.call_args.kwargs["session_attempt"], 3)
+
+    asyncio.run(_run())
+
 
 def _worker(config=None):
   return rollout_worker.RolloutWorker(
@@ -723,6 +750,238 @@ class RolloutWorkerTrajectoryStoreTest(absltest.TestCase):
           env_name="mock_env",
           agent_name="unregistered_agent_xyz",
       )
+
+  def test_task_session_bounce_back_supersedes_live_rollout_and_allows_epoch_reuse(
+      self,
+  ):
+    """End-to-end TaskSession -> RemoteExecutionServer -> RolloutWorker bounce-back."""
+    closed_env_runs: list[int] = []
+    env_run_counter = 0
+    attempt1_sampling = asyncio.Event()
+    trigger_w0_partition = asyncio.Event()
+
+    class _TrackingEnv(mocks.MockEnvironment):
+
+      def __init__(self, **kwargs):
+        super().__init__()
+        del kwargs
+        nonlocal env_run_counter
+        env_run_counter += 1
+        self.run_id = env_run_counter
+
+      def close(self) -> None:
+        closed_env_runs.append(self.run_id)
+
+    class _SelectiveBlockingSampler(mocks.MockBaseSamplerImpl):
+
+      def __init__(self):
+        super().__init__(sampler_name="bounce_sampler", default_delay=0.0)
+        self.sample_calls = 0
+
+      async def sample(self, request, **kwargs):
+        self.sample_calls += 1
+        if request.request_id == "traj_p0_g0" and self.sample_calls == 1:
+          attempt1_sampling.set()
+          await asyncio.Future()
+        if request.request_id == "traj_p_shared_g0":
+          attempt1_sampling.set()
+          await asyncio.Future()
+        return await super().sample(request, **kwargs)
+
+    class _PartitionableInProcessHandle(remote_execution.InProcessActorHandle):
+
+      def __init__(self, server, *, fail_dispatch: bool = False):
+        super().__init__(server)
+        self.fail_dispatch = fail_dispatch
+        self.partition_once = False
+
+      async def dispatch_task(
+          self, request_id=None, method_name=None, *args, **kwargs
+      ) -> str:
+        if self.fail_dispatch:
+          raise ConnectionError("w1 unreachable on dispatch")
+        return await super().dispatch_task(
+            request_id, method_name, *args, **kwargs
+        )
+
+      async def poll_responses(self, timeout_s=50.0):
+        if self.partition_once:
+          await trigger_w0_partition.wait()
+          self.partition_once = False
+          raise ConnectionError("w0 transient network partition")
+        return await super().poll_responses(timeout_s=timeout_s)
+
+    with (
+        tempfile.TemporaryDirectory() as store_dir,
+        mock.patch.object(
+            registry.ENV_REGISTRY, "get", return_value=_TrackingEnv
+        ),
+    ):
+      store_cfg = {
+          "backend": "file",
+          "root_dir": str(store_dir),
+          "run_id": "bounce_back_run",
+      }
+      w0 = rollout_worker.RolloutWorker(
+          worker_id="w0",
+          config=rollout_worker.RolloutConfig(
+              trajectory_store_config=store_cfg
+          ),
+          sampler=_SelectiveBlockingSampler(),
+          env_name="mock_env",
+          agent_name="mock_agent",
+          tokenizer=mocks.MockTokenizer(),
+          chat_parser=mocks.MockChatParser(),
+      )
+      w1 = rollout_worker.RolloutWorker(
+          worker_id="w1",
+          config=rollout_worker.RolloutConfig(
+              trajectory_store_config=store_cfg
+          ),
+          sampler=mocks.MockBaseSamplerImpl(
+              sampler_name="w1_sampler", default_delay=0.0
+          ),
+          env_name="mock_env",
+          agent_name="mock_agent",
+          tokenizer=mocks.MockTokenizer(),
+          chat_parser=mocks.MockChatParser(),
+      )
+      assert w0.trajectory_store is not None
+      assert w1.trajectory_store is not None
+      recorded_w0_statuses: list[str] = []
+      orig_update_meta = w0.trajectory_store.update_metadata
+
+      def _spy_update_meta(metadata):
+        recorded_w0_statuses.append(str(metadata.status))
+        return orig_update_meta(metadata)
+
+      w0.trajectory_store.update_metadata = _spy_update_meta  # type: ignore[method-assign]
+
+      srv0 = remote_execution.InProcessRemoteExecutionServer(w0)
+      srv1 = remote_execution.InProcessRemoteExecutionServer(w1)
+      h0 = _PartitionableInProcessHandle(srv0)
+      h0.partition_once = True
+      h1 = _PartitionableInProcessHandle(srv1, fail_dispatch=True)
+      live_actors: list[remote_execution.ActorHandle] = [h0, h1]
+
+      def _on_unreachable(actor, exc):
+        del exc
+        if actor in live_actors:
+          live_actors.remove(actor)
+        if actor is h1:
+          # w0 recovers and rejoins before attempt 3 routes.
+          live_actors.append(h0)
+
+      async def _run():
+        async with task_session.TaskSession(
+            lambda: list(live_actors),
+            route_fn=lambda actors, key: actors[0],
+            fault_tolerance_config=task_session.TaskSessionFaultToleranceConfig(
+                max_task_retries=3,
+                on_worker_unreachable=_on_unreachable,
+            ),
+            pass_session_attempt=True,
+        ) as session:
+          req_epoch1 = datatypes.RolloutRequest(
+              request_id="traj_p0_g0",
+              prompt="Solve 2+2",
+              prompt_id="p0",
+              group_index=0,
+              generation_kwargs={"max_generation_steps": 32},
+          )
+          await session.submit("traj_p0_g0", "generate", requests=[req_epoch1])
+          await asyncio.wait_for(attempt1_sampling.wait(), timeout=2.0)
+          self.assertLen(w0.manager._active_tasks, 1)
+
+          # Partition w0 -> failover to w1 (fails) -> bounce back to w0
+          # (session_attempt=3), superseding live attempt 1 on srv0/w0.
+          trigger_w0_partition.set()
+          batch1 = await session.poll_completed(timeout_s=5.0)
+          self.assertLen(batch1, 1)
+          resps1, err1 = batch1[0]
+          self.assertIsNone(err1)
+          self.assertLen(resps1, 1)
+          self.assertEqual(resps1[0].status, "COMPLETED")
+          self.assertEqual(session.stale_responses_total, 0)
+          self.assertEmpty(srv0._in_flight_requests)
+          self.assertEmpty(w0.manager._active_tasks)
+          # Both attempt 1 (cancelled) and attempt 3 (completed) closed env.
+          self.assertEqual(closed_env_runs, [1, 2])
+          # Verify w0 NEVER wrote transient CANCELLED metadata during drain.
+          self.assertNotIn("CANCELLED", recorded_w0_statuses)
+          w0.trajectory_store.flush()
+          stored_metas = w0.trajectory_store.get_trajectories_metadata(
+              [req_epoch1.traj_id]
+          )
+          self.assertLen(stored_metas, 1)
+          self.assertNotEqual(stored_metas[0].status, "CANCELLED")
+
+          # Epoch-2 reuse of the same `traj_p0_g0` with `session_attempt=1`
+          # executes cleanly with 0 tombstones.
+          req_epoch2 = datatypes.RolloutRequest(
+              request_id="traj_p0_g0",
+              prompt="Solve 2+2 again",
+              prompt_id="p0",
+              group_index=0,
+              generation_kwargs={"max_generation_steps": 32},
+          )
+          await session.submit("traj_p0_g0", "generate", requests=[req_epoch2])
+          batch2 = await session.poll_completed(timeout_s=5.0)
+          self.assertLen(batch2, 1)
+          resps2, err2 = batch2[0]
+          self.assertIsNone(err2)
+          self.assertEqual(resps2[0].status, "COMPLETED")
+          self.assertEqual(closed_env_runs, [1, 2, 3])
+
+          # Cross-worker non-clobbering check: w0 blocks in Attempt 1 on
+          # `traj_p_shared_g0`, w1 finishes Attempt 2 and persists terminal
+          # metadata to the shared FileTrajectoryStore, and cancelling w0's
+          # lingering task via `srv0` leaves w1's stored status untouched.
+          attempt1_sampling.clear()
+          shared_req = datatypes.RolloutRequest(
+              request_id="traj_shared_race",
+              prompt="Shared race prompt",
+              prompt_id="p_shared",
+              group_index=0,
+              generation_kwargs={"max_generation_steps": 32},
+          )
+          await srv0.dispatch_task(
+              remote_execution.ExecutionRequest(
+                  "req_shared",
+                  "generate",
+                  (),
+                  {"requests": [shared_req], "session_attempt": 1},
+              )
+          )
+          await asyncio.wait_for(attempt1_sampling.wait(), timeout=2.0)
+          w1_out = await w1.generate([shared_req], session_attempt=2)
+          self.assertEqual(w1_out[0].status, "COMPLETED")
+          w1.trajectory_store.flush()
+          w1_metas = w1.trajectory_store.get_trajectories_metadata(
+              [shared_req.traj_id]
+          )
+          self.assertLen(w1_metas, 1)
+          w1_terminal_status = w1_metas[0].status
+          self.assertNotEqual(w1_terminal_status, "CANCELLED")
+
+          # Cancel w0's lingering Attempt 1 task on `srv0` and drain it.
+          lingering_entry = srv0._in_flight_requests["req_shared"]
+          assert lingering_entry.task is not None
+          lingering_entry.task.cancel()
+          with contextlib.suppress(asyncio.CancelledError):
+            await lingering_entry.task
+          w0.trajectory_store.flush()
+          self.assertNotIn("CANCELLED", recorded_w0_statuses)
+          shared_metas = w1.trajectory_store.get_trajectories_metadata(
+              [shared_req.traj_id]
+          )
+          self.assertLen(shared_metas, 1)
+          self.assertEqual(shared_metas[0].status, w1_terminal_status)
+
+        w0.stop()
+        w1.stop()
+
+      asyncio.run(_run())
 
 
 def _collect_otel_metrics(reader: sdk_metrics_export.InMemoryMetricReader):

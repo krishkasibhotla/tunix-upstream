@@ -4833,6 +4833,297 @@ class RemoteExecutionTest(parameterized.TestCase):
 
     asyncio.run(_run())
 
+  def test_execution_request_and_response_attempt_tuple_compat_and_validation(
+      self,
+  ):
+    # Default attempt=1 emits legacy 4-tuple and 7-tuple wire layouts.
+    req_default = remote_lib.ExecutionRequest("r1", "run", (1,), {"x": 2})
+    self.assertEqual(req_default.attempt, 1)
+    self.assertLen(req_default._as_tuple(), 4)
+    restored_default = remote_lib.ExecutionRequest.deserialize_chunks(
+        req_default.serialize_chunks()
+    )
+    self.assertEqual(restored_default.attempt, 1)
+
+    # `session_attempt` in kwargs keeps legacy 4-tuple while populating attempt.
+    req_kw = remote_lib.ExecutionRequest(
+        "r1", "run", (), {"session_attempt": 3}
+    )
+    self.assertEqual(req_kw.attempt, 3)
+    self.assertLen(req_kw._as_tuple(), 4)
+    restored_kw = remote_lib.ExecutionRequest.deserialize_chunks(
+        req_kw.serialize_chunks()
+    )
+    self.assertEqual(restored_kw.attempt, 3)
+
+    # Explicit `attempt > 1` without `session_attempt` kwarg uses 5-tuple.
+    req_explicit = remote_lib.ExecutionRequest("r1", "run", (), {}, attempt=4)
+    self.assertLen(req_explicit._as_tuple(), 5)
+    restored_explicit = remote_lib.ExecutionRequest.deserialize_chunks(
+        req_explicit.serialize_chunks()
+    )
+    self.assertEqual(restored_explicit.attempt, 4)
+
+    resp_default = remote_lib.ExecutionResponse(result="ok", request_id="r1")
+    self.assertEqual(resp_default.attempt, 1)
+    self.assertLen(resp_default._as_tuple(), 7)
+    self.assertEqual(
+        remote_lib.ExecutionResponse.deserialize_chunks(
+            resp_default.serialize_chunks()
+        ).attempt,
+        1,
+    )
+
+    resp_retry = remote_lib.ExecutionResponse(
+        result="ok", request_id="r1", attempt=3
+    )
+    self.assertLen(resp_retry._as_tuple(), 8)
+    restored_resp = remote_lib.ExecutionResponse.deserialize_chunks(
+        resp_retry.serialize_chunks()
+    )
+    self.assertEqual(
+        (restored_resp.request_id, restored_resp.attempt), ("r1", 3)
+    )
+
+    async def _async_roundtrip():
+      r_req = await remote_lib.ExecutionRequest.deserialize_async_chunks(
+          req_explicit.serialize_async_chunks()
+      )
+      r_resp = await remote_lib.ExecutionResponse.deserialize_async_chunks(
+          resp_retry.serialize_async_chunks()
+      )
+      self.assertEqual(r_req.attempt, 4)
+      assert r_resp is not None
+      self.assertEqual(r_resp.attempt, 3)
+
+    asyncio.run(_async_roundtrip())
+
+    for bad_type in (True, False, 1.5, "1"):
+      with self.assertRaises(TypeError):
+        remote_lib.ExecutionRequest("r", "m", attempt=bad_type)  # type: ignore[arg-type]
+      with self.assertRaises(TypeError):
+        remote_lib.ExecutionRequest(
+            "r", "m", kwargs={"session_attempt": bad_type}
+        )
+      with self.assertRaises(TypeError):
+        remote_lib.ExecutionResponse(attempt=bad_type)  # type: ignore[arg-type]
+    with self.assertRaises(TypeError):
+      remote_lib.ExecutionRequest("r", "m", kwargs={"session_attempt": None})
+    with self.assertRaises(TypeError):
+      remote_lib.ExecutionRequest(
+          "r", "m", kwargs={"session_attempt": None}, attempt=3
+      )
+    for bad_val in (0, -2):
+      with self.assertRaises(ValueError):
+        remote_lib.ExecutionRequest("r", "m", attempt=bad_val)
+      with self.assertRaises(ValueError):
+        remote_lib.ExecutionRequest(
+            "r", "m", kwargs={"session_attempt": bad_val}
+        )
+      with self.assertRaises(ValueError):
+        remote_lib.ExecutionResponse(attempt=bad_val)
+    with self.assertRaisesRegex(ValueError, "conflicts with"):
+      remote_lib.ExecutionRequest(
+          "r", "m", kwargs={"session_attempt": 2}, attempt=3
+      )
+
+  def test_dispatch_task_attempt_supersede_burst_stale_and_epoch_reuse(self):
+    """Superseding cancels prior attempt, drains teardown, and leaves 0 tombstones."""
+    attempt1_started = asyncio.Event()
+    attempt1_teardown_gate = asyncio.Event()
+    attempt1_cleaned = asyncio.Event()
+    attempt3_gate = asyncio.Event()
+    executed_attempts: list[int] = []
+    attempt3_saw_attempt1_cleaned: list[bool] = []
+
+    class _AttemptAwareWorker:
+
+      async def run_job(self, payload: str, *, session_attempt: int = 1) -> str:
+        executed_attempts.append(session_attempt)
+        if session_attempt == 1 and payload == "slow_first":
+          attempt1_started.set()
+          try:
+            await asyncio.Future()
+          finally:
+            await attempt1_teardown_gate.wait()
+            attempt1_cleaned.set()
+        if session_attempt == 3 and payload == "winner":
+          attempt3_saw_attempt1_cleaned.append(attempt1_cleaned.is_set())
+          await attempt3_gate.wait()
+        return f"{payload}:a{session_attempt}"
+
+    async def _run():
+      server = remote_lib.InProcessRemoteExecutionServer(_AttemptAwareWorker())
+
+      # 1. Start attempt 1, then burst-dispatch attempt 2 and attempt 3 while
+      # attempt 1 is blocked in teardown: attempt 2 must never execute, and
+      # attempt 3 must wait for attempt 1 teardown before starting.
+      await server.dispatch_task(
+          remote_lib.ExecutionRequest(
+              "traj_0", "run_job", ("slow_first",), {"session_attempt": 1}
+          )
+      )
+      await asyncio.wait_for(attempt1_started.wait(), timeout=2.0)
+
+      await server.dispatch_task(
+          remote_lib.ExecutionRequest(
+              "traj_0", "run_job", ("middle",), {"session_attempt": 2}
+          )
+      )
+      await server.dispatch_task(
+          remote_lib.ExecutionRequest(
+              "traj_0", "run_job", ("winner",), {"session_attempt": 3}
+          )
+      )
+      # Out-of-order stale attempt 2 and duplicate attempt 3 while attempt 3 is
+      # active are ignored/deduplicated without disturbing attempt 3.
+      await server.dispatch_task(
+          remote_lib.ExecutionRequest(
+              "traj_0", "run_job", ("stale",), {"session_attempt": 2}
+          )
+      )
+      await server.dispatch_task(
+          remote_lib.ExecutionRequest(
+              "traj_0", "run_job", ("dup",), {"session_attempt": 3}
+          )
+      )
+
+      attempt1_teardown_gate.set()
+      attempt3_gate.set()
+      resp = await server.poll_response(timeout_s=2.0)
+      assert resp is not None
+      self.assertEqual(
+          (resp.request_id, resp.attempt, resp.unwrap()),
+          ("traj_0", 3, "winner:a3"),
+      )
+      self.assertIsNone(await server.poll_response(timeout_s=0.0))
+      self.assertEqual(executed_attempts, [1, 3])
+      self.assertEqual(attempt3_saw_attempt1_cleaned, [True])
+      self.assertEmpty(server._in_flight_requests)
+
+      # 2. Epoch-2 reuse of the same `request_id="traj_0"` (`session_attempt=1`)
+      # executes freshly because `_in_flight_requests` retains 0 tombstones.
+      await server.dispatch_task(
+          remote_lib.ExecutionRequest(
+              "traj_0", "run_job", ("epoch2",), {"session_attempt": 1}
+          )
+      )
+      resp_epoch2 = await server.poll_response(timeout_s=2.0)
+      assert resp_epoch2 is not None
+      self.assertEqual(
+          (resp_epoch2.attempt, resp_epoch2.unwrap()), (1, "epoch2:a1")
+      )
+      self.assertEmpty(server._in_flight_requests)
+
+      # 3. On GrpcRemoteExecutionServer, an already-buffered or unacked stale
+      # response from attempt 1 is purged when attempt 2 arrives.
+      grpc_server = remote_lib.GrpcRemoteExecutionServer(
+          _AttemptAwareWorker(), enable_bulk_transport=False
+      )
+      await grpc_server.dispatch_task(
+          remote_lib.ExecutionRequest(
+              "traj_g", "run_job", ("fast1",), {"session_attempt": 1}
+          )
+      )
+      # Stream attempt 1 without ACKing it so it sits in `_unacked_responses`.
+      first_poll = await remote_lib.ExecutionResponse.deserialize_async_chunks(
+          grpc_server._handle_poll_responses(
+              remote_lib.cloudpickle.dumps((1.0, "clientA", None)), context=None
+          )
+      )
+      assert first_poll is not None
+      self.assertEqual(
+          (first_poll.attempt, first_poll.unwrap()), (1, "fast1:a1")
+      )
+      self.assertLen(grpc_server._unacked_responses, 1)
+
+      # Superseding attempt 2 purges the unacked attempt 1 response so the next
+      # poll delivers attempt 2 instead of resending stale attempt 1.
+      await grpc_server.dispatch_task(
+          remote_lib.ExecutionRequest(
+              "traj_g", "run_job", ("fast2",), {"session_attempt": 2}
+          )
+      )
+      self.assertEmpty(grpc_server._unacked_responses)
+      second_poll = await remote_lib.ExecutionResponse.deserialize_async_chunks(
+          grpc_server._handle_poll_responses(
+              remote_lib.cloudpickle.dumps((1.0, "clientA", None)), context=None
+          )
+      )
+      assert second_poll is not None
+      self.assertEqual(
+          (second_poll.attempt, second_poll.unwrap()), (2, "fast2:a2")
+      )
+
+      # 4. Poll-wakeup vs. superseding `dispatch_task` race: a poller already
+      # awaiting `_dequeue_response` (`Queue.get()`) receives attempt 1's
+      # response directly into its waiter Future, and `dispatch_task(attempt=2)`
+      # runs before the poller coroutine steps. The poller must discard
+      # superseded attempt 1 without touching live `entry2` in
+      # `_in_flight_requests` or caching stale data in `_unacked_responses`.
+      race_a1_gate = asyncio.Event()
+      race_a2_gate = asyncio.Event()
+
+      class _RaceWorker:
+
+        async def run_job(self, label: str, *, session_attempt: int = 1) -> str:
+          if session_attempt == 1:
+            await race_a1_gate.wait()
+          else:
+            await race_a2_gate.wait()
+          return f"{label}:a{session_attempt}"
+
+      race_srv = remote_lib.GrpcRemoteExecutionServer(
+          _RaceWorker(), enable_bulk_transport=False
+      )
+      await race_srv.dispatch_task(
+          remote_lib.ExecutionRequest(
+              "traj_race", "run_job", ("r1",), {"session_attempt": 1}
+          )
+      )
+      waiting_poll = asyncio.create_task(
+          remote_lib.ExecutionResponse.deserialize_async_chunks(
+              race_srv._handle_poll_responses(
+                  remote_lib.cloudpickle.dumps((2.0, "clientR", None)),
+                  context=None,
+              )
+          )
+      )
+      # Yield once so `waiting_poll` registers as a waiter on `_response_queue`.
+      await asyncio.sleep(0)
+      race_a1_gate.set()
+      # Let attempt 1 hand `response1` directly to the `Queue.get()` waiter,
+      # then supersede with attempt 2 before `waiting_poll` steps.
+      await asyncio.sleep(0)
+      await race_srv.dispatch_task(
+          remote_lib.ExecutionRequest(
+              "traj_race", "run_job", ("r2",), {"session_attempt": 2}
+          )
+      )
+      self.assertEqual(race_srv._in_flight_requests["traj_race"].attempt, 2)
+      race_a2_gate.set()
+      race_polled = await asyncio.wait_for(waiting_poll, timeout=2.0)
+      assert race_polled is not None
+      self.assertEqual(
+          (race_polled.attempt, race_polled.unwrap()), (2, "r2:a2")
+      )
+      # ACK attempt 2 and confirm `_in_flight_requests` & `_unacked_responses`
+      # are completely clean (no further responses queued -> 0 stream chunks).
+      ack_chunks = [
+          chunk
+          async for chunk in race_srv._handle_poll_responses(
+              remote_lib.cloudpickle.dumps(
+                  (0.0, "clientR", race_polled.ack_id)
+              ),
+              context=None,
+          )
+      ]
+      self.assertEmpty(ack_chunks)
+      self.assertEmpty(race_srv._unacked_responses)
+      self.assertEmpty(race_srv._in_flight_requests)
+
+    asyncio.run(_run())
+
 
 if __name__ == "__main__":
   absltest.main()

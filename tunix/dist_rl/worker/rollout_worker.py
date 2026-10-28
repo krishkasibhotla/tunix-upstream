@@ -23,7 +23,7 @@ import inspect
 import threading
 import time
 import types
-from typing import Any, List, Optional, TYPE_CHECKING, Union
+from typing import Any, Optional, TYPE_CHECKING, Union
 import weakref
 
 from absl import logging
@@ -804,8 +804,14 @@ class RolloutWorker(abstract_worker.Worker):
       self,
       requests: datatypes.RolloutRequest | Sequence[datatypes.RolloutRequest],
       on_complete: Optional[Callable[[datatypes.RolloutResponse], None]] = None,
-  ) -> datatypes.RolloutResponse | List[datatypes.RolloutResponse]:
+      *,
+      session_attempt: int = 1,
+  ) -> datatypes.RolloutResponse | list[datatypes.RolloutResponse]:
     """Coroutine method for single or batched generate requests."""
+    if session_attempt < 1:
+      raise ValueError(
+          f"session_attempt must be >= 1, got {session_attempt}."
+      )
     self._ensure_initialized()
     req_list = (
         [requests]
@@ -850,7 +856,11 @@ class RolloutWorker(abstract_worker.Worker):
         if on_complete is not None
         else None
     )
-    res = await self.manager.generate(requests, on_complete=cb)
+    res = await self.manager.generate(
+        requests,
+        on_complete=cb,
+        session_attempt=session_attempt,
+    )
     if isinstance(res, Sequence):
       responses = [_convert_once(r) for r in res]
       for resp in responses:

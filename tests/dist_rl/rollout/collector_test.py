@@ -17,6 +17,7 @@
 import asyncio
 import dataclasses
 import pathlib
+import threading
 import types
 import unittest
 from unittest import mock
@@ -2354,6 +2355,193 @@ class RolloutCompactRoutedExpertsEncodingTest(absltest.TestCase):
         np.testing.assert_array_equal(
             jax_promo_cmp[0, : len(raw_promo_all)], raw_promo_all
         )
+
+  def test_cancel_unblocks_paused_collector_without_clobbering_store_metadata(
+      self,
+  ):
+    request = datatypes.RolloutRequest(
+        prompt_id="p_cancel",
+        max_response_length=64,
+        generation_kwargs={"max_generation_steps": 16},
+    )
+    agent = mock.MagicMock()
+    agent.name = "agent"
+    mock_store = mock.MagicMock()
+    engine = collector.TrajectoryCollectorEngine(
+        traj_id="t_cancel",
+        request=request,
+        sampler=_MockSampler(),
+        env_client=mock.MagicMock(),
+        agent=agent,
+        tokenizer=_MockTokenizer(),
+        chat_parser=_RecordingParser(),
+        trajectory_store=mock_store,
+    )
+
+    entered_model_call = asyncio.Event()
+    record_metadata_calls = 0
+
+    class _PausedInnerEngine:
+
+      def __init__(self, *, model_call, trajectory_store=None, **kwargs):
+        del kwargs
+        self._model_call = model_call
+        self.trajectory_store = trajectory_store
+
+      def record_metadata(self):
+        nonlocal record_metadata_calls
+        record_metadata_calls += 1
+
+      async def collect(self, mode="Token"):
+        del mode
+        entered_model_call.set()
+        try:
+          return await self._model_call([{"role": "user", "content": "hi"}])
+        finally:
+          if self.trajectory_store is not None:
+            self.record_metadata()
+
+    async def _run():
+      engine.pause()
+      with mock.patch.object(
+          collector.rl_collect_engine,
+          "TrajectoryCollectEngine",
+          _PausedInnerEngine,
+      ):
+        ep_task = asyncio.create_task(engine.run_episode())
+        await asyncio.wait_for(entered_model_call.wait(), timeout=1.0)
+        await asyncio.sleep(0.01)
+        self.assertFalse(ep_task.done())
+
+        engine.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+          await asyncio.wait_for(ep_task, timeout=1.0)
+
+      self.assertIsNone(engine.trajectory_store)
+      self.assertIsNone(engine._inner_engine.trajectory_store)
+      self.assertEqual(record_metadata_calls, 0)
+      self.assertEqual(
+          agent.trajectory.status, datatypes.TrajectoryStatus.CANCELLED
+      )
+
+      # Direct `Task.cancel()` on `run_episode()` (without calling
+      # `engine.cancel()` first) also detaches `trajectory_store` before
+      # `inner_engine.collect()`'s `finally:` runs.
+      entered_model_call.clear()
+      direct_agent = mocks.MockAgent()
+      direct_engine = collector.TrajectoryCollectorEngine(
+          traj_id="t_direct_cancel",
+          request=datatypes.RolloutRequest(
+              prompt_id="p_direct",
+              max_response_length=64,
+              generation_kwargs={"max_generation_steps": 16},
+          ),
+          sampler=_MockSampler(),
+          env_client=mock.MagicMock(),
+          agent=direct_agent,
+          tokenizer=_MockTokenizer(),
+          chat_parser=_RecordingParser(),
+          trajectory_store=mock_store,
+      )
+      direct_engine.pause()
+      with mock.patch.object(
+          collector.rl_collect_engine,
+          "TrajectoryCollectEngine",
+          _PausedInnerEngine,
+      ):
+        direct_task = asyncio.create_task(direct_engine.run_episode())
+        await asyncio.wait_for(entered_model_call.wait(), timeout=1.0)
+        await asyncio.sleep(0.01)
+        direct_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+          await asyncio.wait_for(direct_task, timeout=1.0)
+      self.assertIsNone(direct_engine.trajectory_store)
+      self.assertIsNone(direct_engine._inner_engine.trajectory_store)
+      self.assertEqual(record_metadata_calls, 0)
+
+    asyncio.run(_run())
+
+  def test_unclaimed_env_closed_once_off_loop_and_claimed_env_not_double_closed(
+      self,
+  ):
+    main_thread = threading.current_thread()
+    close_threads: list[threading.Thread] = []
+
+    class _TrackingEnv:
+
+      def close(self) -> None:
+        close_threads.append(threading.current_thread())
+
+    request = datatypes.RolloutRequest(
+        prompt_id="p_env_close",
+        max_response_length=64,
+        generation_kwargs={"max_generation_steps": 16},
+    )
+    env_pre = _TrackingEnv()
+    pre_engine = collector.TrajectoryCollectorEngine(
+        traj_id="t_pre",
+        request=request,
+        sampler=_MockSampler(),
+        env_client=env_pre,
+        agent=mock.MagicMock(),
+        tokenizer=_MockTokenizer(),
+        chat_parser=_RecordingParser(),
+    )
+
+    env_claimed = _TrackingEnv()
+    claimed_engine = collector.TrajectoryCollectorEngine(
+        traj_id="t_claimed",
+        request=request,
+        sampler=_MockSampler(),
+        env_client=env_claimed,
+        agent=mock.MagicMock(),
+        tokenizer=_MockTokenizer(),
+        chat_parser=_RecordingParser(),
+    )
+
+    class _ClosingInnerEngine:
+
+      def __init__(self, *, env, **kwargs):
+        del kwargs
+        self._env = env
+
+      async def collect(self, mode="Token"):
+        del mode
+        await asyncio.to_thread(self._env.close)
+        return {"status": "COMPLETED"}
+
+    async def _run():
+      # Pre-collect cancellation closes unclaimed env off-loop exactly once.
+      pre_engine.cancel()
+      with self.assertRaises(asyncio.CancelledError):
+        await pre_engine.run_episode()
+      await pre_engine.close_unclaimed_env()
+      self.assertLen(close_threads, 1)
+      self.assertIsNot(close_threads[0], main_thread)
+
+      # Once `TrajectoryCollectEngine` claims `env`, `close_unclaimed_env()` is
+      # a no-op so `env.close()` is still called only once.
+      with mock.patch.object(
+          collector.rl_collect_engine,
+          "TrajectoryCollectEngine",
+          _ClosingInnerEngine,
+      ):
+        await claimed_engine.run_episode()
+      await claimed_engine.close_unclaimed_env()
+      self.assertLen(close_threads, 2)
+
+      # A wedged `env.close()` is bounded by `timeout_s` instead of hanging.
+      class _WedgedAsyncEnv:
+
+        async def close(self) -> None:
+          await asyncio.Future()
+
+      await asyncio.wait_for(
+          collector.close_env_client(_WedgedAsyncEnv(), timeout_s=0.02),
+          timeout=1.0,
+      )
+
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":
