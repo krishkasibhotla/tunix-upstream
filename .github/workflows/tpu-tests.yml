@@ -240,7 +240,7 @@ jobs:
     # provides >3x headroom while catching hung processes.
     timeout-minutes: 60
     container:
-      image: vllm/vllm-tpu:nightly-20260911-4b80060-51da0ca # zizmor: ignore[unpinned-images]
+      image: vllm/vllm-tpu:nightly-20261110-02e570d-52e8596 # zizmor: ignore[unpinned-images]
       options: --privileged
       env:
         CLOUD_TPU_ACCELERATOR: v6e-8
