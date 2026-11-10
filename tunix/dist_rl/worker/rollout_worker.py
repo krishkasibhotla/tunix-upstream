@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Iterable, Mapping, Sequence
 import contextlib
 import dataclasses
@@ -38,6 +39,7 @@ from tunix.dist_rl.rollout import sampler as sampler_lib
 from tunix.dist_rl.trajectory import store as trajectory_store_lib
 from tunix.dist_rl.trajectory import trajectory as trajectory_lib
 from tunix.dist_rl.worker import abstract_worker
+from tunix.dist_rl.worker import staging_buffer as staging_buffer_lib
 from tunix.rl.agentic.agents import agent_types
 from tunix.rl.rollout import base_rollout
 
@@ -68,12 +70,22 @@ class RolloutConfig(base_rollout.RolloutConfig):
 
   trajectory_store_config: Mapping[str, Any] | None = None
   drain_timeout_s: float = timeouts.DEFAULT_DRAIN_TIMEOUT_S
+  staging_max_bytes: int | None = None
 
   def __post_init__(self) -> None:
     super().__post_init__()
     self.drain_timeout_s = timeouts.validate_positive_finite(
         self.drain_timeout_s, "drain_timeout_s"
     )
+    if self.staging_max_bytes is not None and (
+        isinstance(self.staging_max_bytes, bool)
+        or not isinstance(self.staging_max_bytes, int)
+        or self.staging_max_bytes <= 0
+    ):
+      raise ValueError(
+          "staging_max_bytes must be a positive int or None, got"
+          f" {self.staging_max_bytes!r}."
+      )
 
 
 TrajectoryOrError = Union[
@@ -546,6 +558,11 @@ class RolloutWorker(abstract_worker.Worker):
         if config is not None
         else timeouts.DEFAULT_DRAIN_TIMEOUT_S
     )
+    self._staging_buffer = staging_buffer_lib.RolloutStagingBuffer(
+        worker_id=worker_id,
+        max_bytes=config.staging_max_bytes if config is not None else None,
+    )
+    self._clear_staged_lock = asyncio.Lock()
     self.manager = manager_lib.RolloutManager(
         config=config,
         sampler=sampler,
@@ -558,6 +575,7 @@ class RolloutWorker(abstract_worker.Worker):
         chat_parser=chat_parser,
         drain_timeout_s=drain_timeout_s,
         trajectory_store=self._trajectory_store,
+        staging_buffer=self._staging_buffer,
     )
     self._otel = _RolloutWorkerOtelMetrics(
         worker_id=worker_id,
@@ -593,6 +611,8 @@ class RolloutWorker(abstract_worker.Worker):
             ),
             "drain_timeout_s": self.manager.drain_timeout_s,
             "partial_rollout": self.manager.partial_rollout,
+            "routed_experts_shape": self.sampler.routed_experts_shape(),
+            "staging_max_bytes": self._staging_buffer.max_bytes,
         },
     )
 
@@ -624,6 +644,8 @@ class RolloutWorker(abstract_worker.Worker):
             trajectory_store_config=trajectory_store_config,
             drain_timeout_s=self.manager.drain_timeout_s,
             partial_rollout=self.manager.partial_rollout,
+            routed_experts_shape=self.sampler.routed_experts_shape(),
+            staging_max_bytes=self._staging_buffer.max_bytes,
         )
       self.state = WorkerState.INITIALIZING
       try:
@@ -632,6 +654,8 @@ class RolloutWorker(abstract_worker.Worker):
             trajectory_store_config=trajectory_store_config,
             drain_timeout_s=self.manager.drain_timeout_s,
             partial_rollout=self.manager.partial_rollout,
+            routed_experts_shape=self.sampler.routed_experts_shape(),
+            staging_max_bytes=self._staging_buffer.max_bytes,
         )
       except Exception:
         self.state = WorkerState.ERROR
@@ -880,11 +904,11 @@ class RolloutWorker(abstract_worker.Worker):
     t0 = time.perf_counter()
     result = await self.manager.weight_sync(request, **kwargs)
     self._otel.record_weight_sync_phase("h2d", t0)
-    if isinstance(result, int):
+    if isinstance(result, int) and not isinstance(result, bool):
       self._policy_version = result
     else:
       version = getattr(request, "policy_version", None)
-      if version is not None:
+      if isinstance(version, int) and not isinstance(version, bool):
         self._policy_version = version
       else:
         self._policy_version += 1
@@ -895,10 +919,51 @@ class RolloutWorker(abstract_worker.Worker):
     """Publishes the new weights and resumes serving."""
     t0 = time.perf_counter()
     result = await self.manager.post_weight_sync(sync_request, **kwargs)
+    if isinstance(sync_request, datatypes.WeightSyncRequest):
+      committed_version = sync_request.policy_version
+      min_retained = sync_request.min_retained_policy_version
+    else:
+      committed_version = self._policy_version
+      min_retained = None
+    self._policy_version = committed_version
+    self._staging_buffer.on_post_weight_sync(
+        committed_version, min_retained_policy_version=min_retained
+    )
     self.state = WorkerState.READY
     self._otel.record_post_weight_sync(t0)
     self._record_round(sync_request, "committed")
     return result
+
+  def fetch_staged(self, ref_ids: Sequence[int]) -> dict[int, np.ndarray]:
+    """Returns staged `routed_experts` arrays for `ref_ids` (Bulk TCP pull)."""
+    self._ensure_initialized()
+    return self._staging_buffer.fetch_staged(ref_ids)
+
+  def release_staged(self, ref_ids: Sequence[int]) -> int:
+    """Idempotently releases staged `routed_experts` entries for `ref_ids`."""
+    return self._staging_buffer.release_staged(ref_ids)
+
+  async def clear_staged(self) -> int:
+    """Cancels all active rollouts, drains reservations, and clears staged entries."""
+    async with self._clear_staged_lock:
+      self._staging_buffer.begin_clear()
+      completed = False
+      try:
+        self.manager.cancel_all()
+        active_tasks = list(self.manager.active_tasks)
+        if active_tasks:
+          await asyncio.gather(*active_tasks, return_exceptions=True)
+        else:
+          await asyncio.sleep(0)
+        completed = True
+        return self._staging_buffer.finish_clear()
+      finally:
+        if not completed:
+          self._staging_buffer.abort_clear()
+
+  def get_metrics(self) -> dict[str, int | float]:
+    """Returns current RolloutWorker staging telemetry metrics."""
+    return self._staging_buffer.metrics()
 
   async def bind_weight_sync(self, **kwargs) -> Any:
     """Binds the destination-side transport via the manager."""
