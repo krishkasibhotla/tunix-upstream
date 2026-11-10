@@ -63,13 +63,13 @@ def _hp(*argv: str) -> resolve_config.DistHyperParameters:
 def _vllm_rollout_config(*argv: str):
   """Returns the RolloutConfig built for the `rollout_engine=vllm` worker."""
   hp = _hp("rollout_engine=vllm", *argv)
-  return rollout._rollout_config(hp, mock.Mock(), sampler_type="vllm")
+  return rollout.build_rollout_config(hp, mock.Mock(), sampler_type="vllm")
 
 
 def _vllm_engine_kwargs(*argv: str) -> Mapping[str, Any]:
   """Returns the AsyncEngineArgs kwargs of the `rollout_engine=vllm` worker."""
   hp = _hp("rollout_engine=vllm", *argv)
-  config = rollout._rollout_config(hp, mock.Mock(), sampler_type="vllm")
+  config = rollout.build_rollout_config(hp, mock.Mock(), sampler_type="vllm")
   sampler = rollout._create_vllm_sampler(hp, "rollout-0", mock.Mock(), config)
   assert isinstance(sampler, vllm_sampler.VllmSampler)
   return sampler._engine_kwargs
@@ -78,11 +78,13 @@ def _vllm_engine_kwargs(*argv: str) -> Mapping[str, Any]:
 def _inprocess_vllm_rollout_config(*argv: str):
   """Returns the RolloutConfig built for the `inprocess_vllm` worker."""
   hp = _hp(*argv)
-  return rollout._rollout_config(hp, mock.Mock(), sampler_type="inprocess_vllm")
+  return rollout.build_rollout_config(
+      hp, mock.Mock(), sampler_type="inprocess_vllm"
+  )
 
 
 def _rollout_config(*argv: str):
-  return rollout._rollout_config(
+  return rollout.build_rollout_config(
       _hp(*argv), mock.Mock(), sampler_type="inprocess_vllm"
   )
 
@@ -111,7 +113,7 @@ class ModelFamilyTest(absltest.TestCase):
   def test_raw_mode_uses_raw_text_parser(self):
     hp = _hp("chat_parser_config.type=raw")
     self.assertIsInstance(
-        rollout._create_chat_parser(hp, mock.Mock()), parser.RawTextParser
+        rollout.create_chat_parser(hp, mock.Mock()), parser.RawTextParser
     )
 
   def test_gemma4_mapping_includes_preprocessing_and_fused_projections(self):
@@ -188,7 +190,7 @@ class ModelFamilyTest(absltest.TestCase):
 class RolloutConfigTest(absltest.TestCase):
 
   def test_builds_dist_rollout_config_from_config(self):
-    config = rollout._rollout_config(
+    config = rollout.build_rollout_config(
         _hp(
             "rollout_config.max_prompt_length=128",
             "rollout_config.total_generation_steps=64",
@@ -216,18 +218,18 @@ class RolloutConfigTest(absltest.TestCase):
     tokenizer = mock.Mock()
     tokenizer.encode.return_value = [7]
     hp = _hp("rollout_config.eos_tokens='<|im_end|>,3'")
-    self.assertEqual(rollout._eos_token_ids(hp, tokenizer), [7, 3])
+    self.assertEqual(rollout.eos_token_ids(hp, tokenizer), [7, 3])
     tokenizer.encode.assert_called_once_with(
         "<|im_end|>", add_special_tokens=False
     )
 
     tokenizer.encode.return_value = [7, 8]
     with self.assertRaisesRegex(ValueError, "is not a single token"):
-      rollout._eos_token_ids(hp, tokenizer)
+      rollout.eos_token_ids(hp, tokenizer)
 
   def test_empty_eos_tokens_defer_to_tokenizer(self):
     self.assertIsNone(
-        rollout._eos_token_ids(_hp("rollout_config.eos_tokens="), mock.Mock())
+        rollout.eos_token_ids(_hp("rollout_config.eos_tokens="), mock.Mock())
     )
 
   def test_trajectory_store_config_reaches_rollout_config(self):
@@ -266,7 +268,7 @@ class RolloutConfigTest(absltest.TestCase):
 
   def test_lora_config_requires_rank(self):
     with self.assertRaisesRegex(ValueError, "missing 'rank'"):
-      rollout._validate_rollout_config(
+      rollout.validate_rollout_config(
           _hp("rollout_model_config.lora_config={'alpha': 64.0}")
       )
     self.assertEqual(
@@ -287,7 +289,7 @@ class RolloutConfigTest(absltest.TestCase):
     with self.assertRaisesRegex(
         ValueError, "episode_timeout_secs must be a positive finite number"
     ):
-      rollout._validate_rollout_config(
+      rollout.validate_rollout_config(
           _hp("agentic_grpo_config.episode_timeout=0")
       )
 
@@ -305,13 +307,13 @@ class RolloutConfigPlumbingTest(absltest.TestCase):
   def test_vllm_model_version_only_for_vllm_samplers(self):
     hp = _hp()
     self.assertEqual(
-        rollout._rollout_config(
+        rollout.build_rollout_config(
             hp, mock.Mock(), sampler_type="vanilla"
         ).rollout_vllm_model_version,
         "",
     )
     self.assertEqual(
-        rollout._rollout_config(
+        rollout.build_rollout_config(
             hp, mock.Mock(), sampler_type="vllm"
         ).rollout_vllm_model_version,
         "Qwen/Qwen3-1.7B",
@@ -322,13 +324,13 @@ class ValidateRolloutConfigTest(absltest.TestCase):
 
   def test_rejects_return_logprobs_false(self):
     with self.assertRaisesRegex(ValueError, "return_logprobs must be true"):
-      rollout._validate_rollout_config(
+      rollout.validate_rollout_config(
           _hp("rollout_config.return_logprobs=false")
       )
 
   def test_rejects_lora_with_vanilla_sampler(self):
     with self.assertRaisesRegex(ValueError, "not supported with.*vanilla"):
-      rollout._validate_rollout_config(
+      rollout.validate_rollout_config(
           _hp(
               "rollout_engine=vanilla",
               "rollout_model_config.lora_config={'rank': 8, 'alpha': 8.0}",
@@ -339,13 +341,13 @@ class ValidateRolloutConfigTest(absltest.TestCase):
     for rollout_engine in ("inprocess_vllm", "vllm", "vanilla"):
       with self.subTest(rollout_engine=rollout_engine):
         with self.assertRaisesRegex(ValueError, "server_mode: false"):
-          rollout._validate_rollout_config(
+          rollout.validate_rollout_config(
               _hp(
                   f"rollout_engine={rollout_engine}",
                   "vllm_config.server_mode=false",
               )
           )
-    rollout._validate_rollout_config(
+    rollout.validate_rollout_config(
         _hp("rollout_engine=vllm", "vllm_config.server_mode=true")
     )
 
@@ -355,13 +357,13 @@ class ValidateRolloutConfigTest(absltest.TestCase):
         with self.assertRaisesRegex(
             ValueError, "tpu_backend_type is only supported"
         ):
-          rollout._validate_rollout_config(
+          rollout.validate_rollout_config(
               _hp(
                   f"rollout_engine={rollout_engine}",
                   "vllm_config.tpu_backend_type=torchax",
               )
           )
-    rollout._validate_rollout_config(
+    rollout.validate_rollout_config(
         _hp(
             "rollout_engine=inprocess_vllm",
             "vllm_config.tpu_backend_type=torchax",
@@ -745,7 +747,7 @@ class EngineKwargsTest(absltest.TestCase):
             "vllm_config.engine_kwargs is only supported with rollout_engine:"
             " vllm",
         ):
-          rollout._validate_rollout_config(
+          rollout.validate_rollout_config(
               _hp(
                   f"rollout_engine={rollout_engine}",
                   "vllm_config.engine_kwargs.enable_expert_parallel=true",
