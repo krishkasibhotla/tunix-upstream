@@ -94,6 +94,7 @@ def finalize_dist_config(hp: cli_config.HyperParameters) -> None:
     hp: Loaded configuration; updated in place.
   """
   _finalize_dist_defaults(hp)
+  _validate_local_settings(hp)
   _validate_dist_invariants(hp)
 
 
@@ -614,6 +615,16 @@ def _validate_fault_tolerance(hp: cli_config.HyperParameters) -> None:
     raise ValueError(
         "cluster_config.min_active_rollout_grace_s must be finite and >= 0,"
         f" got {grace}."
+    )
+
+
+def _validate_local_settings(hp: cli_config.HyperParameters) -> None:
+  """Validates `cluster_config.local.download_model_weights`."""
+  local = hp.config_mapping("cluster_config")["local"]
+  if not isinstance(local["download_model_weights"], bool):
+    raise TypeError(
+        "cluster_config.local.download_model_weights must be a bool, got"
+        f" {local['download_model_weights']!r}."
     )
 
 
@@ -1284,6 +1295,7 @@ def render_bash_exports(hp: cli_config.HyperParameters) -> str:
           json.dumps(vllm["kwargs"], sort_keys=True) if vllm["kwargs"] else ""
       ),
       "LOCAL_AUTO_DETECT_PCI_TPUS": local["auto_detect_pci_tpus"],
+      "LOCAL_DOWNLOAD_MODEL_WEIGHTS": local["download_model_weights"],
       "LOCAL_TRAINER_TPU_CHIPS": local["trainer_tpu_chips"],
       "LOCAL_ROLLOUT_TPU_CHIPS": local["rollout_tpu_chips"],
       "LOCAL_INFERENCE_TPU_CHIPS": local["inference_tpu_chips"],

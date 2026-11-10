@@ -74,8 +74,8 @@ ChatParser = (
 Tokenizer = node_utils.HfTokenizer
 
 # Keep in sync with every vLLM kwarg set from other config fields or rollout
-# invariants in `_rollout_config` and `VllmSampler` (`hbm_utilization` is an
-# alias guard for `gpu_memory_utilization`).
+# invariants in `build_rollout_config` and `VllmSampler` (`hbm_utilization` is
+# an alias guard for `gpu_memory_utilization`).
 _FORBIDDEN_ROLLOUT_KWARGS = frozenset({
     "model",
     "tokenizer",
@@ -277,7 +277,7 @@ def _vllm_engine_kwargs(
   return dict(engine_kwargs)
 
 
-def _validate_rollout_config(hp: resolve_config.DistHyperParameters) -> None:
+def validate_rollout_config(hp: resolve_config.DistHyperParameters) -> None:
   """Validates rollout-only settings before any heavy import or JAX init.
 
   Args:
@@ -352,9 +352,10 @@ def _chat_parser_for(
   )
 
 
-def _create_chat_parser(
+def create_chat_parser(
     hp: resolve_config.DistHyperParameters, tokenizer: Tokenizer
 ) -> ChatParser:
+  """Creates the rollout worker's chat parser from `chat_parser_config`."""
   chat_cfg = hp.config_mapping("chat_parser_config")
   return _chat_parser_for(
       _rollout_model_family_name(hp),
@@ -438,7 +439,7 @@ def _maxtext_additional_config(
   )
 
 
-def _eos_token_ids(
+def eos_token_ids(
     hp: resolve_config.DistHyperParameters, tokenizer: Tokenizer
 ) -> list[int] | None:
   """Resolves `rollout_config.eos_tokens` into token ids, or None when empty.
@@ -482,7 +483,7 @@ def _eos_token_ids(
   return token_ids
 
 
-def _rollout_config(
+def build_rollout_config(
     hp: resolve_config.DistHyperParameters,
     tokenizer: Tokenizer,
     sampler_type: str,
@@ -518,9 +519,9 @@ def _rollout_config(
       top_p=float(rollout["top_p"]),
       # <= 0 disables top-k filtering in both the vanilla and vLLM samplers.
       top_k=int(rollout["top_k"]),
-      # Required by the trainer; `_validate_rollout_config` rejects `false`.
+      # Required by the trainer; `validate_rollout_config` rejects `false`.
       return_logprobs=True,
-      eos_tokens=_eos_token_ids(hp, tokenizer),
+      eos_tokens=eos_token_ids(hp, tokenizer),
       partial_rollout=bool(ws["in_flight_weight_updates"]),
       drain_timeout_s=timeouts.drain_timeout_for(_episode_timeout_secs(hp)),
       trajectory_store_config=node_utils.trajectory_store_config(hp),
@@ -584,7 +585,7 @@ def _with_vllm_settings(
       ),
       rollout_vllm_model_version=vllm_model,
       # Both vLLM samplers always run in server mode;
-      # `_validate_rollout_config` rejects `vllm_config.server_mode: false`.
+      # `validate_rollout_config` rejects `vllm_config.server_mode: false`.
       rollout_vllm_server_mode=True,
       rollout_vllm_init_with_random_weights=(
           resolve_config.rollout_init_with_random_weights(hp)
@@ -776,7 +777,7 @@ def _create_rollout_worker(
   )
 
   rollout_engine = str(hp.config["rollout_engine"])
-  config = _rollout_config(hp, tokenizer, sampler_type=rollout_engine)
+  config = build_rollout_config(hp, tokenizer, sampler_type=rollout_engine)
   sampler = _SAMPLER_BUILDERS[rollout_engine](hp, worker_id, tokenizer, config)
   logging.info("Creating RolloutWorker wrapper...")
   return rollout_worker.RolloutWorker(
@@ -784,7 +785,7 @@ def _create_rollout_worker(
       config=config,
       sampler=sampler,
       tokenizer=tokenizer_adapter_lib.TokenizerAdapter(tokenizer),
-      chat_parser=_create_chat_parser(hp, tokenizer),
+      chat_parser=create_chat_parser(hp, tokenizer),
       env_name=str(hp.config["env_class_path"]),
       agent_name=str(hp.config["agent_class_path"]),
       env_config=hp.config_mapping("env_kwargs"),
@@ -813,7 +814,7 @@ def main(
 
   hp = resolve_config.initialize(argv)
   node_utils.apply_library_env(hp, "rollout")
-  _validate_rollout_config(hp)
+  validate_rollout_config(hp)
   worker_id = node_utils.worker_id(hp, "rollout", LOCAL_WORKER_ID)
   port = node_utils.service_port(hp, "rollout")
   # Before the slow startup below (registry import, JAX cache restore, JAX
