@@ -1,4 +1,3 @@
-
 <!-- DO NOT REMOVE! Placeholder for TOC. -->
 
 # Tunix: A Lightweight LLM Post-Training Library
@@ -7,10 +6,10 @@
 post-training of Large Language Models on accelerators. It provides efficient
 and scalable support for:
 
-- **SOTA Training performance on TPUs**
-- **Supervised Fine-Tuning**
+- **SOTA Training performance on TPUs and NVIDIA GPUs**
+- **Supervised Fine-Tuning & Knowledge Distillation**
 - **Reinforcement Learning (RL)**
-- **Agentic RL**
+- **Agentic RL & Multimodal Post-Training**
 
 Tunix leverages the power of JAX for accelerated computation and seamless
 integration with JAX-based modeling frameworks like
@@ -38,22 +37,24 @@ See [Design Overview](design.md) for more details on the architecture.
 
 ## Key Features
 
--   **[Supervised Fine-Tuning (SFT)](algorithms.md)**:
-    -   Full Weights Fine-Tuning
-    -   [PEFT](performance.md#peft-with-lora) (Parameter-Efficient Fine-Tuning)
-    -   [DPO](https://arxiv.org/abs/2305.18290) (Direct Preference Optimization)
+-   **[Supervised Fine-Tuning (SFT) & Preference Alignment](algorithms.md)**:
+    -   Full Weights Fine-Tuning & Multimodal (Vision/Audio) SFT
+    -   [PEFT](performance.md#peft-with-lora) (Parameter-Efficient Fine-Tuning with LoRA/QLoRA)
+    -   [DPO](https://arxiv.org/abs/2305.18290) (Direct Preference Optimization, including VLM DPO)
         -   [ORPO](https://arxiv.org/abs/2403.07691) (Odds Ratio Preference
             Optimization)
+-   **[Knowledge Distillation](algorithms.md)**:
+    -   Logit distillation, feature projection/pooling, and attention transfer strategies
 -   **[Reinforcement Learning (RL)](algorithms.md)**:
     -   [PPO](https://arxiv.org/abs/1707.06347) (Proximal Policy Optimization)
     -   [GRPO](https://arxiv.org/abs/2402.03300) (Group Relative Policy
         Optimization)
         -   [GSPO-Token](https://arxiv.org/abs/2507.18071) (Token-level Group
             Sequence Policy Optimization)
-        -   [DAPO](https://arxiv.org/abs/2503.14476) (Direct Alignment via
-            Preference Optimization)
-        -   [Dr.GRPO](https://arxiv.org/abs/2503.20783) (Distributionally Robust
-            GRPO)
+        -   [DAPO](https://arxiv.org/abs/2503.14476) (Decoupled Clip and Dynamic
+            sAmpling Policy Optimization)
+        -   [Dr.GRPO](https://arxiv.org/abs/2503.20783) (Dr. GRPO: GRPO Done
+            Right)
 -   **[Agentic RL](agentic_rl.md)**:
     -   Multi-turn tool use
     -   Asynchronous rollout for high-throughput trajectory collection
@@ -66,10 +67,10 @@ See [Design Overview](design.md) for more details on the architecture.
     -   Easy to customize and extend
 -   **Performance & Efficiency**:
     -   Native [vLLM](rollout.md#vllm) on TPU integration for performant rollout
+    -   Native [GPU Support](gpu_support.md) with Tokamax Flash Attention, grouped MoE matmul, and Triton paged KV attention
     -   Native [MaxText](https://github.com/AI-Hypercomputer/maxtext) model
         integration for high performance kernels and model execution
-    -   [Micro-batching](performance.md#batching-config) support for component
-        level efficient execution
+    -   [Collocated and Disaggregated Distributed RL](performance.md#collocated-vs-disaggregated-training) with [Micro-batching](performance.md#batching-config) support
 -   **Stability**
     -   Seamless multi-host distributed training with Pathways which can scale
         up to thousands of devices
@@ -81,7 +82,7 @@ See [Design Overview](design.md) for more details on the architecture.
 
 ## Getting Started
 
-**Installation:** Jump to [Installation](https://tunix.readthedocs.io/en/latest/quickstart.html#installation) to install Tunix and run your first training
+**Installation:** Jump to [Installation](quickstart.md#installation) to install Tunix and run your first training
 job.
 
 For TPU users integrating `vllm` and `tpu-inference`, there are two supported
@@ -97,7 +98,7 @@ setup paths:
 These are separate entry points. If you are building the Docker image, you do
 not need to run the install script inside the container build.
 
-**Examples:** To get started, we have a number of detailed examples and tutorials. You can see [Quick Start](https://tunix.readthedocs.io/en/latest/quickstart.html) for a great set of starting examples and [Examples and Guides](https://tunix.readthedocs.io/en/latest/examples.html) for a comprehensive list of all the notebooks and examples we have.
+**Examples:** To get started, we have a number of detailed examples and tutorials. You can see [Quick Start](quickstart.md) for a great set of starting examples and [Examples and Guides](examples.md) for a comprehensive list of all the notebooks and examples we have.
 
 ## Supported Models
 

@@ -1,5 +1,5 @@
 ```{include} intro.md
-:start-line: 2
+:start-line: 1
 ```
 
 ```{toctree}

@@ -10,10 +10,10 @@
 post-training of Large Language Models on accelerators. It provides efficient
 and scalable support for:
 
-- **SOTA Training performance on TPUs**
-- **Supervised Fine-Tuning**
+- **SOTA Training performance on TPUs and NVIDIA GPUs**
+- **Supervised Fine-Tuning & Knowledge Distillation**
 - **Reinforcement Learning (RL)**
-- **Agentic RL**
+- **Agentic RL & Multimodal Post-Training**
 
 Tunix leverages the power of JAX for accelerated computation and seamless
 integration with JAX-based modeling frameworks like
@@ -39,22 +39,25 @@ tuning workflows on top of the XLA and JAX infrastructure. See [Design Overview]
 ![Tunix in JAX ecosystem](docs/images/tunix_in_jax_ecosystem.png)
 
 ## Key Features
--   **[Supervised Fine-Tuning (SFT)](https://tunix.readthedocs.io/en/latest/algorithms.html)**:
-    -   Full Weights Fine-Tuning
+
+-   **[Supervised Fine-Tuning (SFT) & Preference Alignment](https://tunix.readthedocs.io/en/latest/algorithms.html)**:
+    -   Full Weights Fine-Tuning & Multimodal (Vision/Audio) SFT
     -   [PEFT](https://tunix.readthedocs.io/en/latest/performance.html#peft-with-lora) (Parameter-Efficient
-        Fine-Tuning)
-    -   [DPO](https://arxiv.org/abs/2305.18290) (Direct Preference Optimization)
+        Fine-Tuning with LoRA/QLoRA)
+    -   [DPO](https://arxiv.org/abs/2305.18290) (Direct Preference Optimization, including VLM DPO)
       -   [ORPO](https://arxiv.org/abs/2403.07691) (Odds Ratio Preference Optimization)
+-   **[Knowledge Distillation](https://tunix.readthedocs.io/en/latest/algorithms.html)**:
+    -   Logit distillation, feature projection/pooling, and attention transfer strategies
 -   **[Reinforcement Learning (RL)](https://tunix.readthedocs.io/en/latest/algorithms.html)**:
     -   [PPO](https://arxiv.org/abs/1707.06347) (Proximal Policy Optimization)
     -   [GRPO](https://arxiv.org/abs/2402.03300) (Group Relative Policy
         Optimization)
       -   [GSPO-Token](https://arxiv.org/abs/2507.18071) (Token-level Group
           Sequence Policy Optimization)
-      -   [DAPO](https://arxiv.org/abs/2503.14476) (Direct Alignment via Preference
-          Optimization)
-      -   [Dr.GRPO](https://arxiv.org/abs/2503.20783) (Distributionally Robust
-          GRPO)
+      -   [DAPO](https://arxiv.org/abs/2503.14476) (Decoupled Clip and Dynamic
+          sAmpling Policy Optimization)
+      -   [Dr.GRPO](https://arxiv.org/abs/2503.20783) (Dr. GRPO: GRPO Done
+          Right)
 -   **[Agentic RL](https://tunix.readthedocs.io/en/latest/agentic_rl.html)**:
     -   Multi-turn tool use
     -   Asynchronous rollout for high-throughput trajectory collection
@@ -73,10 +76,10 @@ tuning workflows on top of the XLA and JAX infrastructure. See [Design Overview]
 -   **Performance & Efficiency**:
     -   Native [vLLM](https://tunix.readthedocs.io/en/latest/rollout.html#vllm) on TPU
         integration for performant rollout
+    -   Native [GPU Support](https://tunix.readthedocs.io/en/latest/gpu_support.html) with Tokamax Flash Attention, grouped MoE matmul, and Triton paged KV attention
     -   Native [MaxText](https://github.com/AI-Hypercomputer/maxtext) model
         integration for high performance kernels and model execution
-    -   [Micro-batching](https://tunix.readthedocs.io/en/latest/performance.html#batching-config) support for component
-        level efficient execution
+    -   [Collocated and Disaggregated Distributed RL](https://tunix.readthedocs.io/en/latest/performance.html#collocated-vs-disaggregated-training) with [Micro-batching](https://tunix.readthedocs.io/en/latest/performance.html#batching-config) support
 -   **Stability**
     -   Seamless multi-host distributed training with Pathways which can scale
         up to thousands of devices
