@@ -112,6 +112,34 @@ class DistHyperParameters(cli_config.HyperParameters):
     finalize_dist_config(self)
 
 
+def _sync_packed_token_budget(
+    section: MutableMapping[str, Any], section_name: str
+) -> None:
+  """Validates and syncs `max_seq_tokens_per_device` and `max_seq_token_per_tpu`."""
+  dev_val = section["max_seq_tokens_per_device"]
+  tpu_val = section["max_seq_token_per_tpu"]
+  for key, val in (
+      ("max_seq_tokens_per_device", dev_val),
+      ("max_seq_token_per_tpu", tpu_val),
+  ):
+    if val is not None and (
+        isinstance(val, bool) or not isinstance(val, int) or val < 0
+    ):
+      raise ValueError(
+          f"{section_name}.{key} must be a non-negative integer or None, got"
+          f" {val!r}."
+      )
+  if dev_val is not None and tpu_val is not None and dev_val != tpu_val:
+    raise ValueError(
+        f"{section_name}.max_seq_tokens_per_device ({dev_val}) and"
+        f" {section_name}.max_seq_token_per_tpu ({tpu_val}) must match when"
+        " both are set."
+    )
+  resolved = dev_val if dev_val is not None else tpu_val
+  section["max_seq_tokens_per_device"] = resolved
+  section["max_seq_token_per_tpu"] = resolved
+
+
 def _mutable_section(
     hp: cli_config.HyperParameters, key: str
 ) -> MutableMapping[str, Any]:
@@ -203,7 +231,11 @@ def _finalize_dist_defaults(hp: cli_config.HyperParameters) -> None:
           artifact_root / "models" / str(role_cfg["model_name"])
       )
 
+  _sync_packed_token_budget(
+      _mutable_section(hp, "training_config"), "training_config"
+  )
   rl_train = _mutable_section(hp, "rl_training_config")
+  _sync_packed_token_budget(rl_train, "rl_training_config")
   if rl_train["mini_batch_size"] is None:
     rl_train["mini_batch_size"] = int(hp.config["batch_size"])
   if not rl_train["checkpoint_root_directory"]:
@@ -651,7 +683,7 @@ def _validate_dist_invariants(hp: cli_config.HyperParameters) -> None:
           "actor_model_config.model_source='maxtext' requires"
           " actor_model_config.model_path (or model_config.model_path)."
       )
-    if rl_train["max_seq_token_per_tpu"] is None:
+    if not rl_train["max_seq_tokens_per_device"]:
       micro_batch = int(rl_train["train_micro_batch_size"])
       if micro_batch % actor_axes["fsdp"] != 0:
         raise ValueError(
@@ -755,7 +787,7 @@ def _validate_dist_invariants(hp: cli_config.HyperParameters) -> None:
   # `train_micro_batch_size` counts trajectories in the distributed trainer:
   # gradient accumulation = mini_batch_size * num_generations /
   # train_micro_batch_size (not applicable with sequence packing).
-  if not rl_train["max_seq_token_per_tpu"]:
+  if not rl_train["max_seq_tokens_per_device"]:
     trajectories = mini_batch_size * num_generations
     if trajectories % micro_batch != 0:
       raise ValueError(
